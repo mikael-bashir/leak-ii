@@ -1,5 +1,13 @@
-# Start from the official Lean 4 nightly image
-FROM leanprover/lean4:nightly 
+# Start from a standard Ubuntu image
+FROM ubuntu:22.04
+
+# Install basic requirements for Lean and Python
+RUN apt-get update && apt-get install -y curl git build-essential && rm -rf /var/lib/apt/lists/*
+
+# Install Elan (The official Lean version manager)
+ENV ELAN_HOME="/root/.elan"
+ENV PATH="${ELAN_HOME}/bin:${PATH}"
+RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
 
 # Install uv (Python package manager required by lean-lsp-mcp)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
