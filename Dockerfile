@@ -1,8 +1,8 @@
 # Start from a standard Ubuntu image
 FROM ubuntu:22.04
 
-# Install basic requirements for Lean and Python
-RUN apt-get update && apt-get install -y curl git build-essential && rm -rf /var/lib/apt/lists/*
+# Install basic requirements for Lean, Python, and our Nginx proxy
+RUN apt-get update && apt-get install -y curl git build-essential nginx && rm -rf /var/lib/apt/lists/*
 
 # Install Elan (The official Lean version manager)
 ENV ELAN_HOME="/root/.elan"
@@ -19,13 +19,15 @@ WORKDIR /workspace
 # Copy everything from your repository into the container
 COPY . .
 
-# --- HF BUCKET CACHE SETUP ---
-# Create the /data directory (where your HF bucket mounts)
-RUN mkdir -p /data/.lake
-# Symlink the local project cache to the persistent bucket
-RUN ln -s /data/.lake /workspace/.lake
+# --- PROXY CONFIGURATION ---
+# Move our custom nginx config to the correct system folder
+COPY nginx.conf /etc/nginx/sites-available/default
+# Make sure the startup script is executable
+RUN chmod +x /workspace/start.sh
 
-# Pre-build the project so the LSP starts fast
+# --- HF BUCKET CACHE SETUP ---
+RUN mkdir -p /data/.lake
+RUN ln -s /data/.lake /workspace/.lake
 RUN lake build
 
 # Hugging Face Spaces require web apps to listen on port 7860
@@ -35,5 +37,5 @@ EXPOSE 7860
 ENV LEAN_PROJECT_PATH=/workspace
 ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 
-# Start the server using the streamable-http transport
-CMD ["uvx", "lean-lsp-mcp", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
+# Run our proxy startup script instead of directly calling uvx
+CMD ["/workspace/start.sh"]
