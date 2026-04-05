@@ -25,7 +25,7 @@ EXPOSE 7860
 
 # Secure the server and set the project path
 ENV LEAN_PROJECT_PATH=/workspace
-ENV LEAN_MCP_DISABLED_TOOLS="lean_run_code,lean_build"
+ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 
 # Start the server using the streamable-http transport
 CMD ["uvx", "lean-lsp-mcp", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
