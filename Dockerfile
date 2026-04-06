@@ -1,46 +1,25 @@
-# 1. Start from a standard Ubuntu image
+# 1. Standard Ubuntu
 FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y curl git build-essential && rm -rf /var/lib/apt/lists/*
 
-# 2. Install basic requirements + python3 (CRITICAL FIX)
-RUN apt-get update && apt-get install -y curl git build-essential python3 && rm -rf /var/lib/apt/lists/*
-
-# 3. Install Elan (The official Lean version manager)
+# 2. Install Elan (Lean)
 ENV ELAN_HOME="/root/.elan"
 ENV PATH="${ELAN_HOME}/bin:${PATH}"
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
 
-# 4. Install uv (Python package manager)
+# 3. Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
-# 5. Set up your project workspace
+# 4. Workspace & Cache setup
 WORKDIR /workspace
 COPY . .
+RUN mkdir -p /data/.lake && ln -s /data/.lake /workspace/.lake && lake build
 
-# --- THE SOURCE CODE PATCH ---
-# 6. Clone the actual source code of lean-lsp-mcp
-RUN git clone https://github.com/oOo0oOo/lean-lsp-mcp.git /opt/lean-lsp-mcp
-
-# 7. Inject your security bypass setting into the server initialization
-RUN sed -i 's/Server("lean-lsp-mcp")/Server("lean-lsp-mcp", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))/g' /opt/lean-lsp-mcp/src/lean_lsp_mcp/server.py
-RUN sed -i '1i from mcp.server.transport_security import TransportSecuritySettings' /opt/lean-lsp-mcp/src/lean_lsp_mcp/server.py
-
-# 8. Install the modified package (now python3 exists!)
-WORKDIR /opt/lean-lsp-mcp
-RUN uv pip install --system -e .
-
-# 9. Return to your Lean project and set up the Hugging Face cache
-WORKDIR /workspace
-RUN mkdir -p /data/.lake
-RUN ln -s /data/.lake /workspace/.lake
-RUN lake build
-
-# 10. Expose the port Hugging Face expects
+# 5. Environment
 EXPOSE 7860
-
-# 11. Environment variables
 ENV LEAN_PROJECT_PATH=/workspace
 ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 
-# 12. Boot your custom, patched server directly on 0.0.0.0
-CMD ["python3", "-m", "lean_lsp_mcp.server", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
+# 6. The Clean Fix: Run with uvx, but force it to use the pre-bug version of the MCP SDK
+CMD ["uvx", "--with", "mcp<1.24.0", "lean-lsp-mcp", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
