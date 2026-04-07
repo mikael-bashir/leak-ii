@@ -31,4 +31,4 @@ ENV LEAN_PROJECT_PATH=/workspace
 ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 
 # 8. Boot the server cleanly!
-CMD ["python3", "-m", "lean_lsp_mcp.server", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
+CMD ["lean-lsp-mcp", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
