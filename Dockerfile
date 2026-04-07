@@ -16,7 +16,7 @@ WORKDIR /workspace
 COPY . .
 
 # 5. Clone YOUR fork with the security fix
-RUN git clone https://github.com/YOUR_GITHUB_USERNAME/lean-lsp-mcp.git /opt/lean-lsp-mcp
+RUN git clone https://github.com/mikael-bashir/lean-lsp-mcp.git /opt/lean-lsp-mcp
 
 # 6. Install your forked package globally
 WORKDIR /opt/lean-lsp-mcp
