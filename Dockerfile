@@ -1,11 +1,11 @@
 # 1. Base Image
 FROM ubuntu:22.04
 
-# 2. CREATE THE GUEST USER
+# 2. CREATE THE GUEST USER (Fixes Hugging Face permissions)
 RUN useradd -m -u 1000 user
 
-# 3. Install System Dependencies + Nginx
-RUN apt-get update && apt-get install -y curl git build-essential python3 nginx && rm -rf /var/lib/apt/lists/*
+# 3. Install System Dependencies (Nginx is gone!)
+RUN apt-get update && apt-get install -y curl git build-essential python3 && rm -rf /var/lib/apt/lists/*
 
 # 4. Switch to the unprivileged user
 USER user
@@ -19,7 +19,6 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # 6. Setup Workspace
 WORKDIR ${HOME}/app
 COPY --chown=user . ${HOME}/app
-RUN chmod +x ${HOME}/app/start.sh
 
 # 7. Clone & Pre-build your patched fork
 RUN git clone https://github.com/mikael-bashir/lean-lsp-mcp.git ${HOME}/lean-lsp-mcp
@@ -36,5 +35,5 @@ ENV LEAN_PROJECT_PATH=${HOME}/app
 ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 ENV FORWARDED_ALLOW_IPS="*"
 
-# 10. Boot the hardcoded Nginx proxy!
-CMD ["./start.sh"]
+# 10. Boot directly using rock-solid SSE!
+CMD ["/home/user/lean-lsp-mcp/.venv/bin/lean-lsp-mcp", "--transport", "sse", "--port", "7860", "--host", "0.0.0.0"]
