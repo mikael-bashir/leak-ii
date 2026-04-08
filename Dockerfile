@@ -1,34 +1,44 @@
-# 1. Standard Ubuntu + Python
+# 1. Base Image
 FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y curl git build-essential python3 && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Elan (Lean)
-ENV ELAN_HOME="/root/.elan"
-ENV PATH="${ELAN_HOME}/bin:${PATH}"
+# 2. CREATE THE GUEST USER (Crucial for Hugging Face permissions)
+RUN useradd -m -u 1000 user
+
+# 3. Install System Dependencies + Nginx
+RUN apt-get update && apt-get install -y \
+    curl git build-essential python3 nginx \
+    && rm -rf /var/lib/apt/lists/*
+
+# 4. Switch to the unprivileged user for the rest of the build
+USER user
+ENV HOME=/home/user
+ENV PATH="${HOME}/.local/bin:${HOME}/.elan/bin:${PATH}"
+
+# 5. Install Lean (elan) & Python package manager (uv)
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
-
-# 3. Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
 
-# 4. Copy your current Space files (lakefile, etc)
-WORKDIR /workspace
-COPY . .
+# 6. Setup Workspace
+WORKDIR ${HOME}/app
+# Copy your files (lakefile, start.sh, nginx.conf) and give ownership to the guest
+COPY --chown=user . ${HOME}/app
 
-# 5. Clone your public fork WITH the security fix
-RUN git clone https://github.com/mikael-bashir/lean-lsp-mcp.git /opt/lean-lsp-mcp
+# Make sure the startup script is executable
+RUN chmod +x ${HOME}/app/start.sh
 
-# 6. Pre-build the Python environment inside the fork so boot is instant
-WORKDIR /opt/lean-lsp-mcp
+# 7. Clone & Pre-build your patched fork (Safely in the user's home directory)
+RUN git clone https://github.com/mikael-bashir/lean-lsp-mcp.git ${HOME}/lean-lsp-mcp
+WORKDIR ${HOME}/lean-lsp-mcp
 RUN uv sync
 
-# 7. Setup the Hugging Face Lean cache
-WORKDIR /workspace
-RUN mkdir -p /data/.lake && ln -s /data/.lake /workspace/.lake && lake build
+# 8. Setup the Hugging Face Lean cache
+WORKDIR ${HOME}/app
+RUN mkdir -p /data/.lake && ln -s /data/.lake ${HOME}/app/.lake && lake build
 
+# 9. Environment Variables
 EXPOSE 7860
-ENV LEAN_PROJECT_PATH=/workspace
+ENV LEAN_PROJECT_PATH=${HOME}/app
 ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 
-# 8. Boot the compiled binary directly from the virtual environment!
-CMD ["/opt/lean-lsp-mcp/.venv/bin/lean-lsp-mcp", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
+# 10. Boot the Nginx proxy and background Python server
+CMD ["./start.sh"]
