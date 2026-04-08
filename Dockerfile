@@ -1,32 +1,26 @@
 # 1. Base Image
 FROM ubuntu:22.04
 
-# 2. CREATE THE GUEST USER (Crucial for Hugging Face permissions)
+# 2. CREATE THE GUEST USER (Fixes the /data permission crash)
 RUN useradd -m -u 1000 user
 
-# 3. Install System Dependencies + Nginx
-RUN apt-get update && apt-get install -y \
-    curl git build-essential python3 nginx \
-    && rm -rf /var/lib/apt/lists/*
+# 3. Install System Dependencies (No Nginx!)
+RUN apt-get update && apt-get install -y curl git build-essential python3 && rm -rf /var/lib/apt/lists/*
 
-# 4. Switch to the unprivileged user for the rest of the build
+# 4. Switch to the unprivileged user
 USER user
 ENV HOME=/home/user
 ENV PATH="${HOME}/.local/bin:${HOME}/.elan/bin:${PATH}"
 
-# 5. Install Lean (elan) & Python package manager (uv)
+# 5. Install Lean & uv
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 6. Setup Workspace
 WORKDIR ${HOME}/app
-# Copy your files (lakefile, start.sh, nginx.conf) and give ownership to the guest
 COPY --chown=user . ${HOME}/app
 
-# Make sure the startup script is executable
-RUN chmod +x ${HOME}/app/start.sh
-
-# 7. Clone & Pre-build your patched fork (Safely in the user's home directory)
+# 7. Clone & Pre-build your patched fork
 RUN git clone https://github.com/mikael-bashir/lean-lsp-mcp.git ${HOME}/lean-lsp-mcp
 WORKDIR ${HOME}/lean-lsp-mcp
 RUN uv sync
@@ -40,5 +34,9 @@ EXPOSE 7860
 ENV LEAN_PROJECT_PATH=${HOME}/app
 ENV LEAN_MCP_DISABLED_TOOLS="lean_build"
 
-# 10. Boot the Nginx proxy and background Python server
-CMD ["./start.sh"]
+# --- THE MAGIC BULLET ---
+# Forces Python to trust the Hugging Face proxy and generate HTTPS URLs!
+ENV FORWARDED_ALLOW_IPS="*"
+
+# 10. Boot the compiled binary directly!
+CMD ["/home/user/lean-lsp-mcp/.venv/bin/lean-lsp-mcp", "--transport", "streamable-http", "--port", "7860", "--host", "0.0.0.0"]
