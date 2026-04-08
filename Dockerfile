@@ -31,9 +31,9 @@ RUN git clone https://github.com/mikael-bashir/lean-lsp-mcp.git ${HOME}/lean-lsp
 WORKDIR ${HOME}/lean-lsp-mcp
 RUN uv sync
 
-# 8. Setup the Hugging Face Lean cache
+# 8. Build the Lean project natively
 WORKDIR ${HOME}/app
-RUN mkdir -p /data/.lake && ln -s /data/.lake ${HOME}/app/.lake && lake build
+RUN lake build
 
 # 9. Environment Variables
 EXPOSE 7860
