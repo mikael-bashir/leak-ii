@@ -3,3 +3,6 @@ version = "0.1.0"
 
 [[lean_lib]]
 name = "LeakI"
+
+[[lean_lib]]
+name = "Scratch"
