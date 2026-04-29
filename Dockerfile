@@ -41,6 +41,9 @@ RUN uv pip install .
 
 # 8. Setup Lean Mathlib Cache
 WORKDIR ${HOME}/app
+
+RUN lake update
+
 # CRITICAL: Fetch pre-compiled Mathlib binaries during the image build.
 # If you skip this, your first FastMCP request will hang for 3 hours compiling math.
 RUN lake exe cache get
