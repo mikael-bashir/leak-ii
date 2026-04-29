@@ -6,3 +6,7 @@ name = "LeakI"
 
 [[lean_lib]]
 name = "Scratch"
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
