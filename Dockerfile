@@ -27,7 +27,8 @@ COPY --chown=user . ${HOME}/app
 
 # 7. Setup Python Virtual Environment & Install Dependencies
 # Create a venv directly in the app folder and add it to the PATH
-RUN uv venv ${HOME}/app/.venv
+RUN uv python install 3.11
+RUN uv venv --python 3.11 ${HOME}/app/.venv
 ENV PATH="${HOME}/app/.venv/bin:${PATH}"
 
 # Install FastMCP
