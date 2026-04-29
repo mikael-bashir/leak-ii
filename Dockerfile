@@ -32,7 +32,7 @@ RUN uv venv --python 3.11 ${HOME}/app/.venv
 ENV PATH="${HOME}/app/.venv/bin:${PATH}"
 
 # Install FastMCP
-RUN uv pip install fastmcp asyncio
+RUN uv pip install fastmcp asyncio nest_asyncio
 
 # Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv
 WORKDIR ${HOME}/PyPantograph

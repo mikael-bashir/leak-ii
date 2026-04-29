@@ -5,6 +5,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pantograph import Server
 
+import nest_asyncio
+nest_asyncio.apply()
+
 # 1. Initialize FastMCP
 # Binding to 0.0.0.0 exposes the server to the internet/Docker network.
 # This bypasses the default localhost-only security restriction.
