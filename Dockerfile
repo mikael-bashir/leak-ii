@@ -37,6 +37,9 @@ RUN uv pip install fastmcp asyncio nest_asyncio
 # Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv
 WORKDIR ${HOME}/PyPantograph
 RUN git clone --recurse-submodules https://github.com/stanford-centaur/PyPantograph.git .
+
+RUN cp ${HOME}/app/lean-toolchain ./src/lean-toolchain
+RUN python3 build-pantograph.py
 RUN uv pip install .
 
 # 8. Setup Lean Mathlib Cache

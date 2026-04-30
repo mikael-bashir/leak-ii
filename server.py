@@ -8,6 +8,10 @@ from pantograph import Server
 import nest_asyncio
 nest_asyncio.apply()
 
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
 # 1. Initialize FastMCP
 # Binding to 0.0.0.0 exposes the server to the internet/Docker network.
 # This bypasses the default localhost-only security restriction.
@@ -23,7 +27,7 @@ mcp = FastMCP(
 
 
 # 2. Global Configuration & State Management
-TOOL_TIMEOUT = 30.0  # Seconds before we kill a hanging Lean tactic
+TOOL_TIMEOUT = 300.0  # Seconds before we kill a hanging Lean tactic
 lean_server = None
 proof_states = {}    # Maps state_id (str) -> Pantograph State Object
 
@@ -36,26 +40,29 @@ def get_lean_server():
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         lean_server = Server(
             imports=["Mathlib"], 
-            project_path=project_dir
+            project_path=project_dir,
+            timeout=300
         )
     return lean_server
 
 # 3. Expose MCP Tools
 
 @mcp.tool()
-async def init_proof(theorem_statement: str) -> str:
+async def init_proof(proposition: str) -> str:
     """
     Initializes a new proof state.
-    Provide the full theorem statement, e.g., 'theorem add_comm (a b : Nat) : a + b = b + a :='
-    Returns a state_id to be used in subsequent tactic calls.
+    Provide ONLY the mathematical proposition you want to prove.
+    DO NOT include 'theorem name :' or the ':=' at the end.
+    Correct Example: '1 + 1 = 2'
+    Correct Example: '∀ (a b : Nat), a + b = b + a'
     """
     server = get_lean_server()
     state_id = str(uuid.uuid4())
     
     try:
-        # Run in a thread if the pantograph method is blocking, or await if async
+        # We pass the proposition directly to Pantograph
         goal_state = await asyncio.wait_for(
-            asyncio.to_thread(server.goal_start, theorem_statement),
+            asyncio.to_thread(server.goal_start, proposition),
             timeout=TOOL_TIMEOUT
         )
         

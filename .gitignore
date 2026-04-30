@@ -1,3 +1,5 @@
 /.history/
 venv
+/PyPantograph/.lake
+/.lake/
 /PyPantograph
