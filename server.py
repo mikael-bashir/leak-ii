@@ -80,33 +80,37 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
     Applies a Lean 4 tactic to a specific proof state.
     Returns the new goal state or an error if the tactic fails.
     """
+    # 1. Grab the active server instance!
+    server = get_lean_server()
+    
     if state_id not in proof_states:
         return f"Error: State ID '{state_id}' not found. You may need to re-initialize."
         
     current_state = proof_states[state_id]
     
     try:
-        # Execute the tactic with a strict timeout to prevent SSE connection drops
-        result = await asyncio.wait_for(
-            asyncio.to_thread(current_state.tactic, tactic),
+        # 2. Ask the SERVER to apply the tactic to our current state
+        new_state = await asyncio.wait_for(
+            asyncio.to_thread(server.goal_tactic, current_state, tactic),
             timeout=TOOL_TIMEOUT
         )
         
-        if result.is_success:
-            # Pantograph returns a new state object on success. Update our dictionary.
-            proof_states[state_id] = result.new_state
-            
-            if result.new_state.is_solved:
-                return "Tactic succeeded! Proof complete. No goals remaining."
-            else:
-                return f"Tactic succeeded. New Goals:\n{result.new_state.goals}"
+        # 3. Pantograph returned a new state. Update our dictionary.
+        proof_states[state_id] = new_state
+        
+        # 4. Check if the proof is complete
+        # PyPantograph often returns an empty string representation when goals are cleared
+        state_str = str(new_state).strip()
+        if not state_str or state_str == "no goals":
+            return "Tactic succeeded! Proof complete. No goals remaining."
         else:
-            return f"Tactic failed: {result.error_message}"
+            return f"Tactic succeeded. New Goals:\n{state_str}"
             
     except asyncio.TimeoutError:
         return f"Error: Tactic '{tactic}' timed out after {TOOL_TIMEOUT} seconds. Lean may be stuck."
     except Exception as e:
-        return f"Execution error: {str(e)}"
+        # 5. If the tactic is invalid, Lean rejects it and Pantograph throws an error.
+        return f"Tactic failed: {str(e)}"
 
 @mcp.tool()
 async def cleanup_memory() -> str:
