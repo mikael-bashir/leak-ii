@@ -5,6 +5,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pantograph import Server
 import tempfile
+import subprocess
+import json
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -47,6 +49,139 @@ def get_lean_server():
     return lean_server
 
 # 3. Expose MCP Tools
+
+class LeanCompilerDaemon:
+    def __init__(self):
+        self.process: asyncio.subprocess.Process | None = None
+        self.project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
+        self.lock = asyncio.Lock()
+        self.version = 0
+        self.uri = f"file://{os.path.abspath(self.project_dir)}/virtual_sandbox.lean"
+
+    async def boot(self):
+        """Boots the persistent Lean LSP server and completes the JSON-RPC handshake."""
+        logging.info("Booting Persistent Lean Compiler (LSP)...")
+        self.process = await asyncio.create_subprocess_exec(
+            "lake", "serve",
+            cwd=self.project_dir,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # 1. LSP requires an 'initialize' request before it accepts files
+        await self._send_msg("initialize", {
+            "processId": None,
+            "rootUri": f"file://{os.path.abspath(self.project_dir)}",
+            "capabilities": {}
+        }, msg_id=1)
+        
+        # 2. Wait for the server to acknowledge initialization
+        while True:
+            msg = await self._read_msg()
+            if msg.get("id") == 1:
+                break
+                
+        # 3. Send the 'initialized' notification
+        await self._send_msg("initialized", {})
+        logging.info("Warm Compiler Online and Ready.")
+
+    async def _send_msg(self, method: str, params: dict, msg_id: int | None = None):
+        """Formats and sends a JSON-RPC message to the Lean server."""
+        if not self.process or not self.process.stdin:
+            return
+            
+        msg = {"jsonrpc": "2.0", "method": method, "params": params}
+        if msg_id is not None:
+            msg["id"] = msg_id
+            
+        body = json.dumps(msg).encode('utf-8')
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode('utf-8')
+        
+        self.process.stdin.write(header + body)
+        await self.process.stdin.drain()
+
+    async def _read_msg(self) -> dict:
+        """Reads HTTP-style headers and decodes the JSON-RPC response."""
+        if not self.process or not self.process.stdout:
+            raise EOFError("Process is dead.")
+            
+        content_length = 0
+        while True:
+            line_bytes = await self.process.stdout.readline()
+            if not line_bytes:
+                raise EOFError("Lean server closed connection.")
+                
+            line = line_bytes.decode('utf-8').strip()
+            if not line: # Empty line means end of headers
+                break
+            if line.lower().startswith("content-length:"):
+                content_length = int(line.split(":")[1].strip())
+                
+        body = await self.process.stdout.readexactly(content_length)
+        return json.loads(body.decode('utf-8'))
+
+    async def verify_script(self, script: str) -> str:
+        """Sends the script to the warm daemon and waits for diagnostics."""
+        async with self.lock:
+            if not self.process:
+                await self.boot()
+                
+            self.version += 1
+            full_text = script if "import Mathlib" in script else f"import Mathlib\n\n{script}"
+            
+            try:
+                # 1. Tell Lean we "opened" the file with our text
+                await self._send_msg("textDocument/didOpen", {
+                    "textDocument": {
+                        "uri": self.uri,
+                        "languageId": "lean",
+                        "version": self.version,
+                        "text": full_text
+                    }
+                })
+                
+                # 2. Wait for Lean to publish the diagnostics (errors/warnings)
+                diagnostics = []
+                while True:
+                    msg = await asyncio.wait_for(self._read_msg(), timeout=10.0)
+                    if msg.get("method") == "textDocument/publishDiagnostics":
+                        params = msg.get("params", {})
+                        if params.get("uri") == self.uri:
+                            diagnostics = params.get("diagnostics", [])
+                            break
+                            
+                # 3. Tell Lean we "closed" the file to clear it from memory
+                await self._send_msg("textDocument/didClose", {
+                    "textDocument": {"uri": self.uri}
+                })
+                
+                # 4. Parse the results
+                # In LSP, severity 1 = Error. We ignore warnings (severity 2+)
+                errors = [d for d in diagnostics if d.get("severity", 1) == 1]
+                
+                if not errors:
+                    return "✅ Compilation Successful! The proof is 100% verified and structurally sound (Instant LSP Validation)."
+                    
+                error_msgs = []
+                for e in errors:
+                    line_num = e.get("range", {}).get("start", {}).get("line", 0) + 1
+                    message = e.get("message", "Unknown error")
+                    error_msgs.append(f"Line {line_num}: {message}")
+                    
+                return "❌ Compilation Failed:\n" + "\n".join(error_msgs)
+                
+            except asyncio.TimeoutError:
+                return "❌ Verification Error: The Lean LSP server timed out while checking the script."
+            except Exception as e:
+                # If the LSP crashes, kill the process so it reboots next time
+                if self.process:
+                    self.process.kill()
+                    self.process = None
+                return f"❌ Verification Error: {str(e)}"
+
+# Instantiate the daemon globally
+fast_compiler = LeanCompilerDaemon()
 
 @mcp.tool()
 async def init_proof(proposition: str) -> str:
@@ -209,52 +344,66 @@ async def get_current_proof_state(state_id: str) -> str:
         f"{goals}"
     )
 
+# @mcp.tool()
+# async def verify_full_script(script: str) -> str:
+#     """
+#     Tests an entire Lean 4 script for compilation errors by running the Lean compiler.
+#     Use this to verify your final proof script before considering the problem completely solved.
+    
+#     IMPORTANT: Your script MUST include necessary imports (e.g., 'import Mathlib').
+#     """
+#     # Write the agent's script to a temporary Lean file
+#     with tempfile.NamedTemporaryFile(suffix=".lean", delete=False) as f:
+#         # Prepend the Mathlib import to ensure the environment is correct
+#         if "import Mathlib" not in script:
+#             full_script = f"import Mathlib\n\n{script}"
+#         else:
+#             full_script = script
+            
+#         f.write(full_script.encode('utf-8'))
+#         temp_path = f.name
+
+#     try:
+#         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
+        
+#         # Run the actual Lean compiler on the file
+#         process = await asyncio.create_subprocess_exec(
+#             "lake", "env", "lean", temp_path,
+#             cwd=project_dir,
+#             stdout=asyncio.subprocess.PIPE,
+#             stderr=asyncio.subprocess.PIPE
+#         )
+#         stdout, stderr = await process.communicate()
+        
+#         output = stdout.decode().strip() + "\n" + stderr.decode().strip()
+        
+#         # Lean returns 0 if there are no errors (warnings are fine)
+#         if process.returncode == 0 and "error:" not in output.lower():
+#             return "✅ Compilation Successful! The proof is 100% verified and structurally sound.\n\nCompiler Output:\n" + output
+#         else:
+#             return f"❌ Compilation Failed. The REPL steps worked, but the final script has errors:\n{output}"
+            
+#     except Exception as e:
+#         return f"Error running the Lean compiler: {str(e)}"
+#     finally:
+#         # Always clean up the temporary file
+#         if os.path.exists(temp_path):
+#             os.remove(temp_path)
+
 @mcp.tool()
 async def verify_full_script(script: str) -> str:
     """
-    Tests an entire Lean 4 script for compilation errors by running the Lean compiler.
+    Tests an entire Lean 4 script for compilation errors instantly using the LSP daemon.
     Use this to verify your final proof script before considering the problem completely solved.
     
     IMPORTANT: Your script MUST include necessary imports (e.g., 'import Mathlib').
     """
-    # Write the agent's script to a temporary Lean file
-    with tempfile.NamedTemporaryFile(suffix=".lean", delete=False) as f:
-        # Prepend the Mathlib import to ensure the environment is correct
-        if "import Mathlib" not in script:
-            full_script = f"import Mathlib\n\n{script}"
-        else:
-            full_script = script
-            
-        f.write(full_script.encode('utf-8'))
-        temp_path = f.name
-
     try:
-        project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
-        
-        # Run the actual Lean compiler on the file
-        process = await asyncio.create_subprocess_exec(
-            "lake", "env", "lean", temp_path,
-            cwd=project_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        
-        output = stdout.decode().strip() + "\n" + stderr.decode().strip()
-        
-        # Lean returns 0 if there are no errors (warnings are fine)
-        if process.returncode == 0 and "error:" not in output.lower():
-            return "✅ Compilation Successful! The proof is 100% verified and structurally sound.\n\nCompiler Output:\n" + output
-        else:
-            return f"❌ Compilation Failed. The REPL steps worked, but the final script has errors:\n{output}"
-            
+        # Calls our new class instance and guarantees a string return
+        return await fast_compiler.verify_script(script)
     except Exception as e:
-        return f"Error running the Lean compiler: {str(e)}"
-    finally:
-        # Always clean up the temporary file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
+        return f"❌ Unexpected Python error during verification: {str(e)}"
+    
 @mcp.tool()
 async def cleanup_memory() -> str:
     """
