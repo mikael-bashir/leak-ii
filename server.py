@@ -4,6 +4,7 @@ import os
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pantograph import Server
+import tempfile
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -24,7 +25,6 @@ mcp = FastMCP(
     host="0.0.0.0", 
     port=7860
 )
-
 
 # 2. Global Configuration & State Management
 TOOL_TIMEOUT = 300.0  # Seconds before we kill a hanging Lean tactic
@@ -177,21 +177,83 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
 #         return f"Tactic failed: {str(e)}"
 
 @mcp.tool()
-async def get_current_proof(state_id: str) -> str:
+async def get_current_proof_state(state_id: str) -> str:
     """
-    Returns the fully verified Lean 4 proof script constructed so far for a given state.
-    Use this to view the partial proof or pass it to other tools.
+    Returns the fully verified Lean 4 proof script constructed so far AND the current open goals.
+    Use this when you need to check your progress or see what mathematical targets remain unproven.
     """
     if state_id not in proof_ledger:
-        return f"Error: State ID '{state_id}' not found."
+        return f"Error: State ID '{state_id}' not found. The memory may have been cleared or the ID is incorrect."
         
     record = proof_ledger[state_id]
+    current_state = record["state"]
     
+    # 1. Build the script history
     script = f"theorem partial_proof : {record['prop']} := by\n"
-    for t in record["tactics"]:
-        script += f"  {t}\n"
+    if not record["tactics"]:
+        script += "  -- no tactics applied yet\n"
+    else:
+        for t in record["tactics"]:
+            script += f"  {t}\n"
+            
+    # 2. Extract the active mathematical goals from Pantograph
+    goals = str(current_state).strip()
+    if not goals or goals == "no goals":
+        goals = "No goals remaining! The proof is complete."
         
-    return script
+    # 3. Format it clearly for the LLM's context window
+    return (
+        f"=== LEAN 4 SCRIPT SO FAR ===\n"
+        f"```lean4\n{script}```\n\n"
+        f"=== CURRENT OPEN GOALS ===\n"
+        f"{goals}"
+    )
+
+@mcp.tool()
+async def verify_full_script(script: str) -> str:
+    """
+    Tests an entire Lean 4 script for compilation errors by running the Lean compiler.
+    Use this to verify your final proof script before considering the problem completely solved.
+    
+    IMPORTANT: Your script MUST include necessary imports (e.g., 'import Mathlib').
+    """
+    # Write the agent's script to a temporary Lean file
+    with tempfile.NamedTemporaryFile(suffix=".lean", delete=False) as f:
+        # Prepend the Mathlib import to ensure the environment is correct
+        if "import Mathlib" not in script:
+            full_script = f"import Mathlib\n\n{script}"
+        else:
+            full_script = script
+            
+        f.write(full_script.encode('utf-8'))
+        temp_path = f.name
+
+    try:
+        project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
+        
+        # Run the actual Lean compiler on the file
+        process = await asyncio.create_subprocess_exec(
+            "lake", "env", "lean", temp_path,
+            cwd=project_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        output = stdout.decode().strip() + "\n" + stderr.decode().strip()
+        
+        # Lean returns 0 if there are no errors (warnings are fine)
+        if process.returncode == 0 and "error:" not in output.lower():
+            return "✅ Compilation Successful! The proof is 100% verified and structurally sound.\n\nCompiler Output:\n" + output
+        else:
+            return f"❌ Compilation Failed. The REPL steps worked, but the final script has errors:\n{output}"
+            
+    except Exception as e:
+        return f"Error running the Lean compiler: {str(e)}"
+    finally:
+        # Always clean up the temporary file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 @mcp.tool()
 async def cleanup_memory() -> str:
