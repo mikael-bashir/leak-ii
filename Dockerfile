@@ -4,10 +4,13 @@ FROM ubuntu:22.04
 # 2. CREATE THE GUEST USER (Required for Hugging Face Spaces permissions)
 RUN useradd -m -u 1000 user
 
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
 # 3. Install System Dependencies
 # Added python3-venv and cmake (needed to compile PyPantograph's C++ bindings)
 RUN apt-get update && apt-get install -y \
-    curl git build-essential python3 python3-pip python3-venv cmake && \
+    curl git build-essential python3 python3-pip python3-venv cmake tzdata && \
     rm -rf /var/lib/apt/lists/*
 
 # 4. Switch to the unprivileged user
