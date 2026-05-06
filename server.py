@@ -8,17 +8,15 @@ from starlette.middleware.cors import CORSMiddleware
 import json
 import logging
 import uvicorn
+import traceback
 
 import nest_asyncio
 nest_asyncio.apply()
-
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # 1. Initialize FastMCP
-# Binding to 0.0.0.0 exposes the server to the internet/Docker network.
-# This bypasses the default localhost-only security restriction.
 mcp = FastMCP(
     "Leak-II",
     transport_security=TransportSecuritySettings(
@@ -27,17 +25,14 @@ mcp = FastMCP(
 )
 
 # 2. Global Configuration & State Management
-TOOL_TIMEOUT = 300.0  # Seconds before we kill a hanging Lean tactic
+TOOL_TIMEOUT = 300.0  
 lean_server = None
-# proof_states = {}    # Maps state_id (str) -> Pantograph State Object
-proof_ledger = {}  # Maps state_id -> {"state": PantographState, "prop": str, "tactics": list}
+proof_ledger = {}  
 
 def get_lean_server():
     """Lazy initialization of the Pantograph subprocess."""
     global lean_server
     if lean_server is None:
-        # Boot the persistent background Lean process.
-        # This assumes your Docker container has 'lake' in its PATH.
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         lean_server = Server(
             imports=["Mathlib"], 
@@ -46,8 +41,12 @@ def get_lean_server():
         )
     return lean_server
 
-# 3. Expose MCP Tools
-
+# ==========================================
+# THE FAST COMPILER DAEMON (LSP PROTOCOL)
+# ==========================================
+# ==========================================
+# THE FAST COMPILER DAEMON (LSP PROTOCOL)
+# ==========================================
 class LeanCompilerDaemon:
     def __init__(self):
         self.process: asyncio.subprocess.Process | None = None
@@ -55,10 +54,14 @@ class LeanCompilerDaemon:
         self.lock = asyncio.Lock()
         self.version = 0
         self.uri = f"file://{os.path.abspath(self.project_dir)}/virtual_sandbox.lean"
+        self.stderr_task: asyncio.Task | None = None
 
     async def boot(self):
         """Boots the persistent Lean LSP server and completes the JSON-RPC handshake."""
-        logging.info("Booting Persistent Lean Compiler (LSP)...")
+        if self.process and self.process.returncode is None:
+            return
+            
+        logger.info("🚨 Booting Persistent Lean Compiler (LSP)...")
         self.process = await asyncio.create_subprocess_exec(
             "lake", "serve",
             cwd=self.project_dir,
@@ -67,7 +70,10 @@ class LeanCompilerDaemon:
             stderr=asyncio.subprocess.PIPE
         )
         
-        # 1. LSP requires an 'initialize' request before it accepts files
+        # Drain stderr continuously so the OS buffer doesn't fill and freeze the process
+        self.stderr_task = asyncio.create_task(self._log_stderr())
+        
+        # 1. LSP requires an 'initialize' request
         await self._send_msg("initialize", {
             "processId": None,
             "rootUri": f"file://{os.path.abspath(self.project_dir)}",
@@ -76,18 +82,34 @@ class LeanCompilerDaemon:
         
         # 2. Wait for the server to acknowledge initialization
         while True:
-            msg = await self._read_msg()
+            msg = await asyncio.wait_for(self._read_msg(), timeout=30.0)
             if msg.get("id") == 1:
                 break
                 
         # 3. Send the 'initialized' notification
         await self._send_msg("initialized", {})
-        logging.info("Warm Compiler Online and Ready.")
+        logger.info("✅ Warm Compiler Online and Ready.")
+
+    async def _log_stderr(self):
+        """Constantly reads the Lean compiler's standard error to prevent freezing."""
+        if not self.process or not self.process.stderr:
+            return
+        while True:
+            try:
+                line = await self.process.stderr.readline()
+                if not line:
+                    break
+                # Only log warnings/errors to avoid spamming stdout
+                err_text = line.decode('utf-8').strip()
+                if "error" in err_text.lower() or "warning" in err_text.lower():
+                    logger.warning(f"[LSP STDERR]: {err_text}")
+            except Exception:
+                break
 
     async def _send_msg(self, method: str, params: dict, msg_id: int | None = None):
         """Formats and sends a JSON-RPC message to the Lean server."""
         if not self.process or not self.process.stdin:
-            return
+            raise BrokenPipeError("LSP Process is dead or missing stdin.")
             
         msg = {"jsonrpc": "2.0", "method": method, "params": params}
         if msg_id is not None:
@@ -102,34 +124,37 @@ class LeanCompilerDaemon:
     async def _read_msg(self) -> dict:
         """Reads HTTP-style headers and decodes the JSON-RPC response."""
         if not self.process or not self.process.stdout:
-            raise EOFError("Process is dead.")
+            raise EOFError("Process is dead or stdout missing.")
             
         content_length = 0
         while True:
             line_bytes = await self.process.stdout.readline()
             if not line_bytes:
-                raise EOFError("Lean server closed connection.")
+                raise EOFError("Lean server closed connection unexpectedly.")
                 
             line = line_bytes.decode('utf-8').strip()
-            if not line: # Empty line means end of headers
+            if not line:
                 break
             if line.lower().startswith("content-length:"):
                 content_length = int(line.split(":")[1].strip())
                 
+        if content_length == 0:
+            raise ValueError("Empty Content-Length header received.")
+            
         body = await self.process.stdout.readexactly(content_length)
         return json.loads(body.decode('utf-8'))
 
     async def verify_script(self, script: str) -> str:
         """Sends the script to the warm daemon and waits for diagnostics."""
         async with self.lock:
-            if not self.process:
+            if not self.process or self.process.returncode is not None:
+                logger.warning("Daemon dead. Rebooting...")
                 await self.boot()
                 
             self.version += 1
             full_text = script if "import Mathlib" in script else f"import Mathlib\n\n{script}"
             
             try:
-                # 1. Tell Lean we "opened" the file with our text
                 await self._send_msg("textDocument/didOpen", {
                     "textDocument": {
                         "uri": self.uri,
@@ -139,27 +164,41 @@ class LeanCompilerDaemon:
                     }
                 })
                 
-                # 2. Wait for Lean to publish the diagnostics (errors/warnings)
-                diagnostics = []
-                while True:
-                    msg = await asyncio.wait_for(self._read_msg(), timeout=10.0)
-                    if msg.get("method") == "textDocument/publishDiagnostics":
+                latest_diagnostics = []
+                is_processing = True
+                
+                logger.info("Waiting for LSP compilation to complete...")
+                
+                # CRITICAL FIX: We must listen to the $/lean/fileProgress stream.
+                # We update the diagnostics array as they come in, but we ONLY break
+                # the loop when the 'processing' array is empty (meaning Lean is done).
+                while is_processing:
+                    # Massive 180s timeout. Mathlib is huge, give it time if it needs it.
+                    msg = await asyncio.wait_for(self._read_msg(), timeout=180.0)
+                    method = msg.get("method")
+                    
+                    if method == "textDocument/publishDiagnostics":
                         params = msg.get("params", {})
                         if params.get("uri") == self.uri:
-                            diagnostics = params.get("diagnostics", [])
-                            break
+                            latest_diagnostics = params.get("diagnostics", [])
                             
-                # 3. Tell Lean we "closed" the file to clear it from memory
+                    elif method == "$/lean/fileProgress":
+                        params = msg.get("params", {})
+                        doc = params.get("textDocument", {})
+                        if doc.get("uri") == self.uri:
+                            processing = params.get("processing")
+                            # An empty list means Lean has finished all compilation for this file
+                            if isinstance(processing, list) and len(processing) == 0:
+                                is_processing = False
+                                
                 await self._send_msg("textDocument/didClose", {
                     "textDocument": {"uri": self.uri}
                 })
                 
-                # 4. Parse the results
-                # In LSP, severity 1 = Error. We ignore warnings (severity 2+)
-                errors = [d for d in diagnostics if d.get("severity", 1) == 1]
+                errors = [d for d in latest_diagnostics if d.get("severity", 1) == 1]
                 
                 if not errors:
-                    return "✅ Compilation Successful! The proof is 100% verified and structurally sound (Instant LSP Validation)."
+                    return "✅ Compilation Successful! The proof is 100% verified and structurally sound."
                     
                 error_msgs = []
                 for e in errors:
@@ -170,16 +209,23 @@ class LeanCompilerDaemon:
                 return "❌ Compilation Failed:\n" + "\n".join(error_msgs)
                 
             except asyncio.TimeoutError:
-                return "❌ Verification Error: The Lean LSP server timed out while checking the script."
-            except Exception as e:
-                # If the LSP crashes, kill the process so it reboots next time
+                return "❌ Verification Error: The Lean LSP server timed out (took >180s)."
+            except Exception:
+                err_str = traceback.format_exc()
+                logger.error(f"Internal LSP Error:\n{err_str}")
                 if self.process:
-                    self.process.kill()
+                    try:
+                        self.process.kill()
+                    except Exception:
+                        pass
                     self.process = None
-                return f"❌ Verification Error: {str(e)}"
+                return f"❌ Verification Error (LSP Crash):\n{err_str}"
 
-# Instantiate the daemon globally
 fast_compiler = LeanCompilerDaemon()
+
+# ==========================================
+# MCP TOOLS
+# ==========================================
 
 @mcp.tool()
 async def init_proof(proposition: str) -> str:
@@ -197,7 +243,6 @@ async def init_proof(proposition: str) -> str:
             timeout=TOOL_TIMEOUT
         )
         
-        # Start the ledger for this specific proof path
         proof_ledger[state_id] = {
             "state": goal_state,
             "prop": proposition,
@@ -207,32 +252,6 @@ async def init_proof(proposition: str) -> str:
         
     except Exception as e:
         return f"Error initializing proof: {str(e)}"
-    
-# async def init_proof(proposition: str) -> str:
-#     """
-#     Initializes a new proof state.
-#     Provide ONLY the mathematical proposition you want to prove.
-#     DO NOT include 'theorem name :' or the ':=' at the end.
-#     Correct Example: '1 + 1 = 2'
-#     Correct Example: '∀ (a b : Nat), a + b = b + a'
-#     """
-#     server = get_lean_server()
-#     state_id = str(uuid.uuid4())
-    
-#     try:
-#         # We pass the proposition directly to Pantograph
-#         goal_state = await asyncio.wait_for(
-#             asyncio.to_thread(server.goal_start, proposition),
-#             timeout=TOOL_TIMEOUT
-#         )
-        
-#         proof_states[state_id] = goal_state
-#         return f"Proof initialized. State ID: {state_id}\nCurrent Goal:\n{goal_state}"
-        
-#     except asyncio.TimeoutError:
-#         return "Error: Lean timed out while initializing the theorem. Check your syntax."
-#     except Exception as e:
-#         return f"Error initializing proof: {str(e)}"
 
 @mcp.tool()
 async def apply_tactic(state_id: str, tactic: str) -> str:
@@ -253,17 +272,13 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
             timeout=TOOL_TIMEOUT
         )
         
-        # 1. Update the state
         record["state"] = new_state
-        # 2. Add the successful tactic to the deterministic ledger
         record["tactics"].append(tactic)
         
         state_str = str(new_state).strip()
         if not state_str or state_str == "no goals":
-            # 3. AUTO-GENERATE THE 100% VERIFIED SCRIPT
             verified_script = f"theorem auto_proof : {record['prop']} := by\n"
             for t in record["tactics"]:
-                # Basic indentation for readability
                 verified_script += f"  {t}\n" 
                 
             return f"Tactic succeeded! Proof complete. No goals remaining.\n\nHere is the 100% verified Lean script:\n```lean4\n{verified_script}\n```"
@@ -272,42 +287,6 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
             
     except Exception as e:
         return f"Tactic failed: {str(e)}"
-# async def apply_tactic(state_id: str, tactic: str) -> str:
-#     """
-#     Applies a Lean 4 tactic to a specific proof state.
-#     Returns the new goal state or an error if the tactic fails.
-#     """
-#     # 1. Grab the active server instance!
-#     server = get_lean_server()
-    
-#     if state_id not in proof_states:
-#         return f"Error: State ID '{state_id}' not found. You may need to re-initialize."
-        
-#     current_state = proof_states[state_id]
-    
-#     try:
-#         # 2. Ask the SERVER to apply the tactic to our current state
-#         new_state = await asyncio.wait_for(
-#             asyncio.to_thread(server.goal_tactic, current_state, tactic),
-#             timeout=TOOL_TIMEOUT
-#         )
-        
-#         # 3. Pantograph returned a new state. Update our dictionary.
-#         proof_states[state_id] = new_state
-        
-#         # 4. Check if the proof is complete
-#         # PyPantograph often returns an empty string representation when goals are cleared
-#         state_str = str(new_state).strip()
-#         if not state_str or state_str == "no goals":
-#             return "Tactic succeeded! Proof complete. No goals remaining."
-#         else:
-#             return f"Tactic succeeded. New Goals:\n{state_str}"
-            
-#     except asyncio.TimeoutError:
-#         return f"Error: Tactic '{tactic}' timed out after {TOOL_TIMEOUT} seconds. Lean may be stuck."
-#     except Exception as e:
-#         # 5. If the tactic is invalid, Lean rejects it and Pantograph throws an error.
-#         return f"Tactic failed: {str(e)}"
 
 @mcp.tool()
 async def get_current_proof_state(state_id: str) -> str:
@@ -316,12 +295,11 @@ async def get_current_proof_state(state_id: str) -> str:
     Use this when you need to check your progress or see what mathematical targets remain unproven.
     """
     if state_id not in proof_ledger:
-        return f"Error: State ID '{state_id}' not found. The memory may have been cleared or the ID is incorrect."
+        return f"Error: State ID '{state_id}' not found."
         
     record = proof_ledger[state_id]
     current_state = record["state"]
     
-    # 1. Build the script history
     script = f"theorem partial_proof : {record['prop']} := by\n"
     if not record["tactics"]:
         script += "  -- no tactics applied yet\n"
@@ -329,64 +307,16 @@ async def get_current_proof_state(state_id: str) -> str:
         for t in record["tactics"]:
             script += f"  {t}\n"
             
-    # 2. Extract the active mathematical goals from Pantograph
     goals = str(current_state).strip()
     if not goals or goals == "no goals":
         goals = "No goals remaining! The proof is complete."
         
-    # 3. Format it clearly for the LLM's context window
     return (
         f"=== LEAN 4 SCRIPT SO FAR ===\n"
         f"```lean4\n{script}```\n\n"
         f"=== CURRENT OPEN GOALS ===\n"
         f"{goals}"
     )
-
-# @mcp.tool()
-# async def verify_full_script(script: str) -> str:
-#     """
-#     Tests an entire Lean 4 script for compilation errors by running the Lean compiler.
-#     Use this to verify your final proof script before considering the problem completely solved.
-    
-#     IMPORTANT: Your script MUST include necessary imports (e.g., 'import Mathlib').
-#     """
-#     # Write the agent's script to a temporary Lean file
-#     with tempfile.NamedTemporaryFile(suffix=".lean", delete=False) as f:
-#         # Prepend the Mathlib import to ensure the environment is correct
-#         if "import Mathlib" not in script:
-#             full_script = f"import Mathlib\n\n{script}"
-#         else:
-#             full_script = script
-            
-#         f.write(full_script.encode('utf-8'))
-#         temp_path = f.name
-
-#     try:
-#         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
-        
-#         # Run the actual Lean compiler on the file
-#         process = await asyncio.create_subprocess_exec(
-#             "lake", "env", "lean", temp_path,
-#             cwd=project_dir,
-#             stdout=asyncio.subprocess.PIPE,
-#             stderr=asyncio.subprocess.PIPE
-#         )
-#         stdout, stderr = await process.communicate()
-        
-#         output = stdout.decode().strip() + "\n" + stderr.decode().strip()
-        
-#         # Lean returns 0 if there are no errors (warnings are fine)
-#         if process.returncode == 0 and "error:" not in output.lower():
-#             return "✅ Compilation Successful! The proof is 100% verified and structurally sound.\n\nCompiler Output:\n" + output
-#         else:
-#             return f"❌ Compilation Failed. The REPL steps worked, but the final script has errors:\n{output}"
-            
-#     except Exception as e:
-#         return f"Error running the Lean compiler: {str(e)}"
-#     finally:
-#         # Always clean up the temporary file
-#         if os.path.exists(temp_path):
-#             os.remove(temp_path)
 
 @mcp.tool()
 async def verify_full_script(script: str) -> str:
@@ -397,11 +327,12 @@ async def verify_full_script(script: str) -> str:
     IMPORTANT: Your script MUST include necessary imports (e.g., 'import Mathlib').
     """
     try:
-        # Calls our new class instance and guarantees a string return
         return await fast_compiler.verify_script(script)
-    except Exception as e:
-        return f"❌ Unexpected Python error during verification: {str(e)}"
-    
+    except Exception:
+        err_trace = traceback.format_exc()
+        logger.error(f"MCP Tool Exception:\n{err_trace}")
+        return f"❌ Unexpected Python error during verification:\n{err_trace}"
+
 @mcp.tool()
 async def cleanup_memory() -> str:
     """
@@ -415,7 +346,10 @@ async def main_serve():
     logger.info("Booting Lean LSP Daemon...")
     await fast_compiler.boot()
     
-    logger.info("✅ LSP Daemon is fully awake! Fast MCP searches are now available.")
+    logger.info("⏳ Pushing dummy request to load Mathlib into memory. This may take 15-30 seconds...")
+    dummy_script = "import Mathlib\ntheorem warmup : 1 + 1 = 2 := by rdfascdfgasgfl"
+    warmup_result = await fast_compiler.verify_script(dummy_script)
+    logger.info(f"✅ Mathlib Warmup Complete. Daemon is locked in RAM! Result: {warmup_result}")
 
     # 1. Grab the standard Starlette ASGI application
     http_app = mcp.sse_app()
