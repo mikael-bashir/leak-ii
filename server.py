@@ -9,6 +9,7 @@ import json
 import logging
 import uvicorn
 import traceback
+from pathlib import Path
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -44,17 +45,21 @@ def get_lean_server():
 # ==========================================
 # THE FAST COMPILER DAEMON (LSP PROTOCOL)
 # ==========================================
-# ==========================================
-# THE FAST COMPILER DAEMON (LSP PROTOCOL)
-# ==========================================
 class LeanCompilerDaemon:
     def __init__(self):
         self.process: asyncio.subprocess.Process | None = None
         self.project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         self.lock = asyncio.Lock()
         self.version = 0
-        self.uri = f"file://{os.path.abspath(self.project_dir)}/virtual_sandbox.lean"
+        self.sandbox_path = Path(self.project_dir).resolve() / "virtual_sandbox.lean"
+        self.uri = self.sandbox_path.as_uri()
         self.stderr_task: asyncio.Task | None = None
+
+        try:
+            with open(self.sandbox_path, "a") as f:
+                pass
+        except Exception as e:
+            logger.warning(f"OverlayFS copy-up failed: {e}")
 
     async def boot(self):
         """Boots the persistent Lean LSP server and completes the JSON-RPC handshake."""
@@ -88,7 +93,7 @@ class LeanCompilerDaemon:
                 
         # 3. Send the 'initialized' notification
         await self._send_msg("initialized", {})
-        logger.info("✅ Warm Compiler Online and Ready.")
+        logger.info("✅Compiler Warmed up and Ready.")
 
     async def _log_stderr(self):
         """Constantly reads the Lean compiler's standard error to prevent freezing."""
@@ -103,6 +108,8 @@ class LeanCompilerDaemon:
                 err_text = line.decode('utf-8').strip()
                 if "error" in err_text.lower() or "warning" in err_text.lower():
                     logger.warning(f"[LSP STDERR]: {err_text}")
+                elif err_text:
+                    logger.info(f"[LSP INFO]: {err_text}")
             except Exception:
                 break
 
