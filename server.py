@@ -347,7 +347,7 @@ async def main_serve():
     await fast_compiler.boot()
     
     logger.info("⏳ Pushing dummy request to load Mathlib into memory. This may take 15-30 seconds...")
-    dummy_script = "import Mathlib\ntheorem warmup : 1 + 1 = 2 := by rdfascdfgasgfl"
+    dummy_script = "import Mathlib\ntheorem warmup : 1 + 1 = 2 := by rfl"
     warmup_result = await fast_compiler.verify_script(dummy_script)
     logger.info(f"✅ Mathlib Warmup Complete. Daemon is locked in RAM! Result: {warmup_result}")
 

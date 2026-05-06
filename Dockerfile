@@ -25,6 +25,9 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 WORKDIR ${HOME}/app
 COPY --chown=user . ${HOME}/app
 
+# So that file watcher doesn't crash, and to avoid permission errors later
+RUN touch ${HOME}/app/virtual_sandbox.lean
+
 # 7. Setup Python Virtual Environment & Install Dependencies
 # Create a venv directly in the app folder and add it to the PATH
 RUN uv python install 3.11
