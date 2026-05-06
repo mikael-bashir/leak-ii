@@ -4,16 +4,17 @@ import os
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pantograph import Server
-import tempfile
-import subprocess
+from starlette.middleware.cors import CORSMiddleware
 import json
+import logging
+import uvicorn
 
 import nest_asyncio
 nest_asyncio.apply()
 
-import logging
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # 1. Initialize FastMCP
 # Binding to 0.0.0.0 exposes the server to the internet/Docker network.
@@ -22,10 +23,7 @@ mcp = FastMCP(
     "Leak-II",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
-    ),
-    dependencies=["pypantograph"],
-    host="0.0.0.0", 
-    port=7860
+    )
 )
 
 # 2. Global Configuration & State Management
@@ -413,10 +411,36 @@ async def cleanup_memory() -> str:
     proof_ledger.clear()
     return "Memory cleared. All previous state IDs are now invalid."
 
-if __name__ == "__main__":
-    # 4. Start the SSE Server
-    # Required for Hugging Face Spaces / Docker deployments
-    print("Booting FastMCP Server on 0.0.0.0:7860...")
+async def main_serve():
+    logger.info("Booting Lean LSP Daemon...")
+    await fast_compiler.boot()
     
-    # We use the SSE transport instead of standard stdio so agents can connect over HTTP
-    mcp.run(transport="sse")
+    logger.info("✅ LSP Daemon is fully awake! Fast MCP searches are now available.")
+
+    # 1. Grab the standard Starlette ASGI application
+    http_app = mcp.sse_app()
+    
+    # 2. Add the CORS middleware exactly like Leak-I
+    http_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*", "mcp-protocol-version", "mcp-session-id"], 
+        expose_headers=["mcp-session-id"]
+    )
+    
+    # 3. Start Uvicorn programmatically so it shares the CURRENT event loop
+    logger.info("Booting up Leak-II environment...")
+    config = uvicorn.Config(
+        http_app, 
+        host="0.0.0.0", 
+        port=7860,
+        proxy_headers=True,               
+        forwarded_allow_ips="*",
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+if __name__ == "__main__":
+    asyncio.run(main_serve())
