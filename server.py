@@ -50,23 +50,23 @@ class LeanCompilerDaemon:
         self.process: asyncio.subprocess.Process | None = None
         self.project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         self.lock = asyncio.Lock()
-        self.version = 0
+        self.version = 1
         self.sandbox_path = Path(self.project_dir).resolve() / "virtual_sandbox.lean"
         self.uri = self.sandbox_path.as_uri()
         self.stderr_task: asyncio.Task | None = None
-
+        self._is_file_open = False 
+        
+        logger.info(f"🔍 [INIT] URI Target: {self.uri}")
         try:
-            with open(self.sandbox_path, "a") as f:
-                pass
+            with open(self.sandbox_path, "a") as f: pass
         except Exception as e:
-            logger.warning(f"OverlayFS copy-up failed: {e}")
+            logger.error(f"❌ [INIT] File touch failed: {e}")
 
     async def boot(self):
-        """Boots the persistent Lean LSP server and completes the JSON-RPC handshake."""
         if self.process and self.process.returncode is None:
             return
             
-        logger.info("🚨 Booting Persistent Lean Compiler (LSP)...")
+        logger.info("🚨 [BOOT] Starting 'lake serve' subprocess...")
         self.process = await asyncio.create_subprocess_exec(
             "lake", "serve",
             cwd=self.project_dir,
@@ -74,159 +74,140 @@ class LeanCompilerDaemon:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
-        # Drain stderr continuously so the OS buffer doesn't fill and freeze the process
         self.stderr_task = asyncio.create_task(self._log_stderr())
         
-        # 1. LSP requires an 'initialize' request
+        # 1. Handshake
         await self._send_msg("initialize", {
-            "processId": None,
+            "processId": os.getpid(),
             "rootUri": f"file://{os.path.abspath(self.project_dir)}",
-            "capabilities": {}
-        }, msg_id=1)
-        
-        # 2. Wait for the server to acknowledge initialization
+            "capabilities": {"textDocument": {"synchronization": {"change": 1}}} # Full Sync
+        }, msg_id=0)
+
         while True:
             msg = await asyncio.wait_for(self._read_msg(), timeout=30.0)
-            if msg.get("id") == 1:
+            if msg.get("id") == 0:
+                logger.info("✅ [BOOT] Handshake Response Received.")
                 break
                 
-        # 3. Send the 'initialized' notification
         await self._send_msg("initialized", {})
-        logger.info("✅Compiler Warmed up and Ready.")
+        logger.info("✅ [BOOT] Daemon Online.")
 
     async def _log_stderr(self):
-        """Constantly reads the Lean compiler's standard error to prevent freezing."""
-        if not self.process or not self.process.stderr:
-            return
+        if not self.process or not self.process.stderr: return
         while True:
             try:
                 line = await self.process.stderr.readline()
-                if not line:
-                    break
-                # Only log warnings/errors to avoid spamming stdout
-                err_text = line.decode('utf-8').strip()
-                if "error" in err_text.lower() or "warning" in err_text.lower():
-                    logger.warning(f"[LSP STDERR]: {err_text}")
-                elif err_text:
-                    logger.info(f"[LSP INFO]: {err_text}")
-            except Exception:
-                break
+                if not line: break
+                logger.info(f"🛰️ [LSP-STDERR] {line.decode('utf-8').strip()}")
+            except Exception: break
 
     async def _send_msg(self, method: str, params: dict, msg_id: int | None = None):
-        """Formats and sends a JSON-RPC message to the Lean server."""
-        if not self.process or not self.process.stdin:
-            raise BrokenPipeError("LSP Process is dead or missing stdin.")
-            
+        if not self.process or not self.process.stdin: raise BrokenPipeError("LSP Dead")
         msg = {"jsonrpc": "2.0", "method": method, "params": params}
-        if msg_id is not None:
-            msg["id"] = msg_id
-            
-        body = json.dumps(msg).encode('utf-8')
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode('utf-8')
+        if msg_id is not None: msg["id"] = msg_id
         
+        payload = json.dumps(msg)
+        logger.info(f"📤 [LSP-OUT] {payload}") # REVEAL EVERYTHING
+        
+        body = payload.encode('utf-8')
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode('utf-8')
         self.process.stdin.write(header + body)
         await self.process.stdin.drain()
 
     async def _read_msg(self) -> dict:
-        """Reads HTTP-style headers and decodes the JSON-RPC response."""
-        if not self.process or not self.process.stdout:
-            raise EOFError("Process is dead or stdout missing.")
-            
+        if not self.process or not self.process.stdout: raise EOFError("LSP Dead")
         content_length = 0
-        while True:
-            line_bytes = await self.process.stdout.readline()
-            if not line_bytes:
-                raise EOFError("Lean server closed connection unexpectedly.")
-                
-            line = line_bytes.decode('utf-8').strip()
-            if not line:
-                break
-            if line.lower().startswith("content-length:"):
-                content_length = int(line.split(":")[1].strip())
-                
-        if content_length == 0:
-            raise ValueError("Empty Content-Length header received.")
+        try:
+            while True:
+                line_bytes = await self.process.stdout.readline()
+                if not line_bytes: raise EOFError("LSP EOF")
+                line = line_bytes.decode('utf-8').strip()
+                if not line and content_length > 0: break
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.split(":")[1].strip())
             
-        body = await self.process.stdout.readexactly(content_length)
-        return json.loads(body.decode('utf-8'))
+            body_bytes = await self.process.stdout.readexactly(content_length)
+            raw_json = body_bytes.decode('utf-8')
+            logger.info(f"📥 [LSP-IN] {raw_json}") # REVEAL EVERYTHING
+            return json.loads(raw_json)
+        except Exception as e:
+            logger.error(f"❌ [READ-ERR] {e}")
+            return {}
 
     async def verify_script(self, script: str) -> str:
-        """Sends the script to the warm daemon and waits for diagnostics."""
         async with self.lock:
             if not self.process or self.process.returncode is not None:
-                logger.warning("Daemon dead. Rebooting...")
                 await self.boot()
-                
+                self._is_file_open = False
+
             self.version += 1
-            full_text = script if "import Mathlib" in script else f"import Mathlib\n\n{script}"
+            full_text = (script if "import Mathlib" in script else f"import Mathlib\n\n{script}").strip() + "\n\n"
             
             try:
-                await self._send_msg("textDocument/didOpen", {
-                    "textDocument": {
-                        "uri": self.uri,
-                        "languageId": "lean",
-                        "version": self.version,
-                        "text": full_text
-                    }
-                })
+                if not self._is_file_open:
+                    await self._send_msg("textDocument/didOpen", {
+                        "textDocument": {"uri": self.uri, "languageId": "lean", "version": self.version, "text": full_text}
+                    })
+                    self._is_file_open = True
+                else:
+                    await self._send_msg("textDocument/didChange", {
+                        "textDocument": {"uri": self.uri, "version": self.version},
+                        "contentChanges": [{"text": full_text}]
+                    })
                 
                 latest_diagnostics = []
-                is_processing = True
+                received_correct_version = False
+                finished_progress = False
                 
-                logger.info("Waiting for LSP compilation to complete...")
+                logger.info(f"⏳ [WAITING] Loop start for v{self.version}")
                 
-                # CRITICAL FIX: We must listen to the $/lean/fileProgress stream.
-                # We update the diagnostics array as they come in, but we ONLY break
-                # the loop when the 'processing' array is empty (meaning Lean is done).
-                while is_processing:
-                    # Massive 180s timeout. Mathlib is huge, give it time if it needs it.
-                    msg = await asyncio.wait_for(self._read_msg(), timeout=180.0)
+                # THE ULTIMATE LOOP: Wait for BOTH diagnostics and empty progress
+                start_time = asyncio.get_event_loop().time()
+                while not (received_correct_version and finished_progress):
+                    # Check for tool-level timeout
+                    if asyncio.get_event_loop().time() - start_time > 180.0:
+                        raise TimeoutError("Lean timed out (180s)")
+
+                    msg = await self._read_msg()
+                    if not msg: continue
+                    
                     method = msg.get("method")
-                    
                     if method == "textDocument/publishDiagnostics":
-                        params = msg.get("params", {})
-                        if params.get("uri") == self.uri:
-                            latest_diagnostics = params.get("diagnostics", [])
-                            
-                    elif method == "$/lean/fileProgress":
-                        params = msg.get("params", {})
-                        doc = params.get("textDocument", {})
-                        if doc.get("uri") == self.uri:
-                            processing = params.get("processing")
-                            # An empty list means Lean has finished all compilation for this file
-                            if isinstance(processing, list) and len(processing) == 0:
-                                is_processing = False
+                        p = msg.get("params", {})
+                        if p.get("uri") == self.uri:
+                            v = p.get("version")
+                            latest_diagnostics = p.get("diagnostics", [])
+                            # Lean 4.x sometimes doesn't send the version in publishDiagnostics
+                            # If so, we treat it as potentially the right one
+                            if v is None or v == self.version:
+                                received_correct_version = True
+                                logger.info(f"🎯 [MATCH] Diagnostics for v{v} captured.")
                                 
-                await self._send_msg("textDocument/didClose", {
-                    "textDocument": {"uri": self.uri}
-                })
-                
-                errors = [d for d in latest_diagnostics if d.get("severity", 1) == 1]
-                
+                    elif method == "$/lean/fileProgress":
+                        p = msg.get("params", {})
+                        if p.get("textDocument", {}).get("uri") == self.uri:
+                            processing = p.get("processing", [])
+                            if len(processing) == 0:
+                                finished_progress = True
+                                logger.info("🏁 [MATCH] Lean reported processing finished.")
+                            else:
+                                logger.info(f"🏗️ [COMPILING] {len(processing)} ranges remaining...")
+
+                # Construct Result
+                errors = [d for d in latest_diagnostics if d.get("severity", 1) in (1, 2)]
                 if not errors:
-                    return "✅ Compilation Successful! The proof is 100% verified and structurally sound."
-                    
-                error_msgs = []
-                for e in errors:
-                    line_num = e.get("range", {}).get("start", {}).get("line", 0) + 1
-                    message = e.get("message", "Unknown error")
-                    error_msgs.append(f"Line {line_num}: {message}")
-                    
-                return "❌ Compilation Failed:\n" + "\n".join(error_msgs)
+                    res = "✅ Compilation Successful! The proof is 100% verified."
+                else:
+                    res = "❌ Compilation Failed:\n" + "\n".join([f"Line {e['range']['start']['line']+1}: {e['message']}" for e in errors])
                 
-            except asyncio.TimeoutError:
-                return "❌ Verification Error: The Lean LSP server timed out (took >180s)."
-            except Exception:
-                err_str = traceback.format_exc()
-                logger.error(f"Internal LSP Error:\n{err_str}")
-                if self.process:
-                    try:
-                        self.process.kill()
-                    except Exception:
-                        pass
-                    self.process = None
-                return f"❌ Verification Error (LSP Crash):\n{err_str}"
+                logger.info(f"🏁 [VERIFY-COMPLETE] Result length: {len(res)}")
+                return res
+                
+            except Exception as e:
+                logger.error(f"💥 [CRITICAL] {traceback.format_exc()}")
+                if isinstance(e, (EOFError, BrokenPipeError)):
+                    self.process = None # Force reboot on next call
+                return f"❌ Verification Error: {e}"
 
 fast_compiler = LeanCompilerDaemon()
 
