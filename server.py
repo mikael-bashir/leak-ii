@@ -11,8 +11,8 @@ import uvicorn
 import traceback
 from pathlib import Path
 
-import nest_asyncio
-nest_asyncio.apply()
+# import nest_asyncio
+# nest_asyncio.apply()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -312,7 +312,8 @@ async def verify_full_script(script: str) -> str:
     Tests an entire Lean 4 script for compilation errors instantly using the LSP daemon.
     Use this to verify your final proof script before considering the problem completely solved.
     
-    IMPORTANT: Your script MUST include necessary imports (e.g., 'import Mathlib').
+    IMPORTANT: Your script will be injected with "import mathlib", so do not include imports, and assume only
+    mathlib is used.
     """
     try:
         return await fast_compiler.verify_script(script)
@@ -359,7 +360,8 @@ async def main_serve():
         port=7860,
         proxy_headers=True,               
         forwarded_allow_ips="*",
-        log_level="info"
+        log_level="info",
+        loop="asyncio"
     )
     server = uvicorn.Server(config)
     await server.serve()
