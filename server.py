@@ -222,12 +222,15 @@ async def init_proof(proposition: str) -> str:
     Provide ONLY the mathematical proposition you want to prove.
     DO NOT include 'theorem name :' or the ':=' at the end.
     """
-    server = get_lean_server()
     state_id = str(uuid.uuid4())
-    
+
     try:
+        # Construct AND call Pantograph inside the worker thread. Its sync API
+        # (get_lean_server/goal_start) drives a private event loop via
+        # run_until_complete, which raises "Cannot run the event loop while
+        # another loop is running" if invoked on the main thread under uvicorn.
         goal_state = await asyncio.wait_for(
-            asyncio.to_thread(server.goal_start, proposition),
+            asyncio.to_thread(lambda: get_lean_server().goal_start(proposition)),
             timeout=TOOL_TIMEOUT
         )
         
@@ -246,17 +249,16 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
     """
     Applies a Lean 4 tactic to a specific proof state.
     """
-    server = get_lean_server()
-    
     if state_id not in proof_ledger:
         return f"Error: State ID '{state_id}' not found. You may need to re-initialise your proof"
-        
+
     record = proof_ledger[state_id]
     current_state = record["state"]
-    
+
     try:
+        # Run Pantograph's sync API in the worker thread (see init_proof).
         new_state = await asyncio.wait_for(
-            asyncio.to_thread(server.goal_tactic, current_state, tactic),
+            asyncio.to_thread(lambda: get_lean_server().goal_tactic(current_state, tactic)),
             timeout=TOOL_TIMEOUT
         )
         
