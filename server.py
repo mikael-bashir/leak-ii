@@ -55,15 +55,53 @@ proof_ledger: "OrderedDict[str, dict]" = OrderedDict()
 _op_count = 0
 
 
-def get_lean_server():
-    """Lazily construct the Pantograph subprocess (loads Mathlib — slow, once)."""
+def get_lean_server(force_restart: bool = False):
+    """Lazily construct the Pantograph subprocess (loads Mathlib — slow, once).
+
+    Also self-heals a DEAD subprocess. PyPantograph nulls out `server.proc`
+    (via its internal `_close()`) whenever a call times out, hits a decode
+    error, or otherwise crashes — expected behavior, and PyPantograph ships
+    `server.restart()` specifically to recover from it. But this function used
+    to only reconstruct when `_lean_server is None`, and the Python *object*
+    stays non-None forever after its first successful construction even once
+    `.proc` dies inside it — so a single timeout (e.g. from a throttled/
+    resource-starved container blowing past the call timeout) permanently
+    wedged every future call with "Server not running." until the whole
+    container was restarted. Now a dead `.proc` triggers an in-place
+    `.restart()` instead of being silently cached forever.
+    """
     global _lean_server
     if _lean_server is None:
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         logger.info("🚨 [PANTO] constructing Pantograph Server (loading Mathlib)…")
         _lean_server = Server(imports=["Mathlib"], project_path=project_dir, timeout=300)
         logger.info("✅ [PANTO] Pantograph Server ready")
+    elif force_restart or _lean_server.proc is None:
+        logger.warning("♻️  [PANTO] Pantograph subprocess is dead (proc=None) — restarting it")
+        _lean_server.restart()
+        logger.info("✅ [PANTO] Pantograph Server restarted")
     return _lean_server
+
+
+async def _call_pantograph(fn):
+    """Run fn(server) off the event loop (Pantograph's sync API drives its own
+    event loop internally, so it must run off-thread). If the subprocess turns
+    out to be dead — a timeout mid-call also nulls `.proc`, so the failure can
+    surface on the SAME call that killed it, not just the next one — retry
+    ONCE against a freshly restarted server rather than propagating the error.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(lambda: fn(get_lean_server())), timeout=TOOL_TIMEOUT
+        )
+    except Exception as e:
+        if "Server not running" in str(e):
+            logger.warning("♻️  Pantograph call hit a dead subprocess — restarting and retrying once")
+            return await asyncio.wait_for(
+                asyncio.to_thread(lambda: fn(get_lean_server(force_restart=True))),
+                timeout=TOOL_TIMEOUT,
+            )
+        raise
 
 
 def _ledger_put(state_id: str, record: dict):
@@ -101,13 +139,9 @@ async def init_proof(proposition: str) -> str:
     t0 = time.time()
     try:
         async with _lean_lock:
-            # Pantograph's sync API drives its own event loop internally, so it
-            # must run OFF this thread (else "event loop already running"); the
-            # lock guarantees only one call touches the subprocess at a time.
-            goal_state = await asyncio.wait_for(
-                asyncio.to_thread(lambda: get_lean_server().goal_start(proposition)),
-                timeout=TOOL_TIMEOUT,
-            )
+            # The lock guarantees only one call (including a self-heal retry)
+            # touches the subprocess at a time.
+            goal_state = await _call_pantograph(lambda server: server.goal_start(proposition))
         _ledger_put(state_id, {"state": goal_state, "prop": proposition, "tactics": []})
         logger.info(f"✅ [#{n}] initialised {state_id[:8]} in "
                     f"{int((time.time()-t0)*1000)}ms  (ledger={len(proof_ledger)})")
@@ -135,10 +169,7 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
     t0 = time.time()
     try:
         async with _lean_lock:
-            new_state = await asyncio.wait_for(
-                asyncio.to_thread(lambda: get_lean_server().goal_tactic(record["state"], tactic)),
-                timeout=TOOL_TIMEOUT,
-            )
+            new_state = await _call_pantograph(lambda server: server.goal_tactic(record["state"], tactic))
         record["state"] = new_state
         record["tactics"].append(tactic)
         _ledger_put(state_id, record)
