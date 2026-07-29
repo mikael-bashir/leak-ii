@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import uuid
 import json
 import time
@@ -83,49 +84,54 @@ proof_ledger: "OrderedDict[str, dict]" = OrderedDict()
 _op_count = 0
 
 
-def get_lean_server(worker: PantographWorker, force_restart: bool = False):
+async def get_lean_server(worker: PantographWorker, force_restart: bool = False):
     """Lazily construct a worker's Pantograph subprocess (loads Mathlib — slow,
-    once per worker).
+    once per worker) using PyPantograph's ASYNC constructor on the main loop.
+
+    Why async-only: PyPantograph's sync API (`to_sync`) drives one shared
+    module-level event loop from whatever thread calls it, so two workers
+    calling concurrently from different threads collide with "This event loop
+    is already running". The `*_async` methods run natively on our loop and
+    interleave correctly; the per-worker lock still guarantees each subprocess
+    only ever sees one in-flight request.
 
     Also self-heals a DEAD subprocess. PyPantograph nulls out `server.proc`
     (via its internal `_close()`) whenever a call times out, hits a decode
     error, or otherwise crashes — expected behavior, and PyPantograph ships
-    `server.restart()` specifically to recover from it. A dead `.proc`
-    triggers an in-place `.restart()` instead of being silently cached
-    forever (which used to wedge every future call until a container restart).
+    `restart_async()` specifically to recover from it. A dead `.proc`
+    triggers an in-place restart instead of being silently cached forever
+    (which used to wedge every future call until a container restart).
     """
     if worker.server is None:
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         logger.info(f"🚨 [PANTO w{worker.idx}] constructing Pantograph Server (loading Mathlib)…")
-        worker.server = Server(imports=["Mathlib"], project_path=project_dir, timeout=300)
+        worker.server = await Server.create(
+            imports=["Mathlib"], project_path=project_dir, timeout=300
+        )
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server ready")
     elif force_restart or worker.server.proc is None:
         logger.warning(f"♻️  [PANTO w{worker.idx}] subprocess is dead (proc=None) — restarting it")
-        worker.server.restart()
+        await worker.server.restart_async()
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server restarted")
     return worker.server
 
 
-async def _call_pantograph(worker: PantographWorker, fn):
-    """Run fn(server) off the event loop (Pantograph's sync API drives its own
-    event loop internally, so it must run off-thread). If the subprocess turns
-    out to be dead — a timeout mid-call also nulls `.proc`, so the failure can
-    surface on the SAME call that killed it, not just the next one — retry
-    ONCE against a freshly restarted server rather than propagating the error.
+async def _call_pantograph(worker: PantographWorker, coro_fn):
+    """Await coro_fn(server) with a timeout. If the subprocess turns out to be
+    dead — a timeout mid-call also nulls `.proc`, so the failure can surface
+    on the SAME call that killed it, not just the next one — retry ONCE
+    against a freshly restarted server rather than propagating the error.
 
     Caller MUST hold worker.lock.
     """
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(lambda: fn(get_lean_server(worker))), timeout=TOOL_TIMEOUT
-        )
+        server = await get_lean_server(worker)
+        return await asyncio.wait_for(coro_fn(server), timeout=TOOL_TIMEOUT)
     except Exception as e:
         if "Server not running" in str(e):
             logger.warning(f"♻️  [w{worker.idx}] call hit a dead subprocess — restarting and retrying once")
-            return await asyncio.wait_for(
-                asyncio.to_thread(lambda: fn(get_lean_server(worker, force_restart=True))),
-                timeout=TOOL_TIMEOUT,
-            )
+            server = await get_lean_server(worker, force_restart=True)
+            return await asyncio.wait_for(coro_fn(server), timeout=TOOL_TIMEOUT)
         raise
 
 
@@ -154,7 +160,7 @@ async def _gc_worker(idx: int):
         async with w.lock:
             if w.server is None or w.server.proc is None:
                 return
-            await asyncio.wait_for(asyncio.to_thread(w.server.gc), timeout=60)
+            await asyncio.wait_for(w.server.gc_async(), timeout=60)
     except Exception as e:
         logger.warning(f"⚠️  [w{idx}] Lean-side gc failed (non-fatal): {e}")
 
@@ -176,6 +182,37 @@ def _ledger_get(state_id: str):
     if rec is not None:
         proof_ledger.move_to_end(state_id)
     return rec
+
+
+# A tactic that is a bare `intro` with only simple binder names (no patterns,
+# no type ascriptions). Only these are safe to merge textually.
+_PLAIN_INTRO = re.compile(r"^intro(?:\s+[A-Za-z_][A-Za-z0-9_']*)+$")
+
+
+def _assemble_script(name: str, prop: str, tactics: "list[str]") -> str:
+    """Build the Lean script for a finished/partial proof.
+
+    Consecutive plain `intro` steps are merged into one multi-binder `intro`:
+    interactive callers naturally intro one hypothesis per call, but Mathlib's
+    tactic-style linter flags `intro p` / `intro q` on separate lines with a
+    "Try this: intro p q" WARNING — and the Leak IV judge strictly counts any
+    warning as a failed compile (it must: `sorry` is also just a warning). The
+    merge is semantics-preserving for simple identifiers and skipped for
+    anything exotic (patterns, ⟨⟩ destructuring, ascriptions).
+    """
+    lines: "list[str]" = []
+    for tac in tactics:
+        squeezed = " ".join(tac.split())
+        if lines and _PLAIN_INTRO.match(squeezed) and _PLAIN_INTRO.match(lines[-1]):
+            lines[-1] = lines[-1] + squeezed[len("intro"):]
+        elif _PLAIN_INTRO.match(squeezed):
+            lines.append(squeezed)
+        else:
+            lines.append(tac)
+    script = f"theorem {name} : {prop} := by\n"
+    for line in lines:
+        script += f"  {line}\n"
+    return script
 
 
 # =============================================================================
@@ -202,7 +239,7 @@ async def init_proof(proposition: str) -> str:
         async with worker.lock:
             # The worker's lock guarantees only one call (including a
             # self-heal retry) touches ITS subprocess at a time.
-            goal_state = await _call_pantograph(worker, lambda server: server.goal_start(proposition))
+            goal_state = await _call_pantograph(worker, lambda server: server.goal_start_async(proposition))
         _ledger_put(state_id, {"state": goal_state, "prop": proposition,
                                "tactics": [], "worker": worker.idx})
         logger.info(f"✅ [#{n} w{worker.idx}] initialised {state_id[:8]} in "
@@ -232,16 +269,14 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
     t0 = time.time()
     try:
         async with worker.lock:
-            new_state = await _call_pantograph(worker, lambda server: server.goal_tactic(record["state"], tactic))
+            new_state = await _call_pantograph(worker, lambda server: server.goal_tactic_async(record["state"], tactic))
         record["state"] = new_state
         record["tactics"].append(tactic)
         _ledger_put(state_id, record)
         state_str = str(new_state).strip()
         ms = int((time.time() - t0) * 1000)
         if not state_str or state_str == "no goals":
-            script = f"theorem auto_proof : {record['prop']} := by\n"
-            for tac in record["tactics"]:
-                script += f"  {tac}\n"
+            script = _assemble_script("auto_proof", record["prop"], record["tactics"])
             logger.info(f"🏁 [#{n} w{worker.idx}] proof complete for {state_id[:8]} in {ms}ms")
             return ("Tactic succeeded! Proof complete. No goals remaining.\n\n"
                     f"Verified script:\n```lean4\n{script}```")
@@ -260,12 +295,10 @@ async def get_current_proof_state(state_id: str) -> str:
     record = _ledger_get(state_id)
     if record is None:
         return f"Error: State ID '{state_id}' not found."
-    script = f"theorem partial_proof : {record['prop']} := by\n"
     if not record["tactics"]:
-        script += "  -- no tactics applied yet\n"
+        script = f"theorem partial_proof : {record['prop']} := by\n  -- no tactics applied yet\n"
     else:
-        for tac in record["tactics"]:
-            script += f"  {tac}\n"
+        script = _assemble_script("partial_proof", record["prop"], record["tactics"])
     goals = str(record["state"]).strip()
     if not goals or goals == "no goals":
         goals = "No goals remaining! The proof is complete."
@@ -314,7 +347,8 @@ async def _warmup():
         try:
             # Building the Server loads Mathlib; a trivial goal forces it fully.
             async with w.lock:
-                await asyncio.to_thread(lambda w=w: get_lean_server(w).goal_start("True"))
+                server = await get_lean_server(w)
+                await server.goal_start_async("True")
             logger.info(f"✅ Warmup w{w.idx} complete — Pantograph + Mathlib resident.")
         except Exception as e:
             logger.error(f"⚠️  Warmup w{w.idx} did not finish: {e}")
