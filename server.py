@@ -16,7 +16,7 @@ from pantograph import Server
 import uvicorn
 
 # =============================================================================
-# Leak PyPantograph service (interactive proof state) — WORKER POOL
+# Leak PyPantograph service — GHOST-DAEMON ARMY over one resident Lean
 # -----------------------------------------------------------------------------
 # The CONSTRUCTION surface for hard proofs: init_proof gives a goal state, and
 # apply_tactic advances it one tactic at a time, returning the resulting goals —
@@ -24,32 +24,39 @@ import uvicorn
 # on the separate LSP-daemon space and remains the trusted final gate; this box
 # is the scratchpad, not the judge.
 #
-# Parallelism model (the reason for the pool):
-#   Pantograph's wire protocol is one-write-then-one-read on a single stdio
-#   pipe with NO request ids, so a single subprocess can never serve two
-#   concurrent calls — responses would be misattributed or the reader crashes.
-#   Instead of one global lock serialising every caller (the old design), we
-#   run POOL_SIZE independent Pantograph subprocesses. Each worker has its own
-#   lock; every proof state is pinned at init_proof time to the worker that
-#   created it, and all later calls on that state go through that worker's
-#   lock. Callers on DIFFERENT states therefore run truly in parallel, while
-#   any one subprocess still sees strictly serial traffic.
+# Execution model — proof-state snapshotting (after Shen & Shi, "Keep the
+# Proof State Live", arXiv:2605.25556):
+#   Lean proof state has two parts with wildly different costs. The
+#   Environment (all of Mathlib, ~2-4 GB) is immutable and loaded ONCE into
+#   the resident daemon; the per-proof state (open goals, metavariables) is
+#   kilobytes. Pantograph's goal states are PERSISTENT: applying a tactic
+#   yields a NEW state id while the parent stays alive and reusable. So an
+#   "army of daemons" needs no extra processes at all — every ghost daemon is
+#   just a ledger entry pointing at a KB-sized goal state inside the one
+#   warm subprocess, and context switching between ghosts is a dict lookup.
+#   On top of that substrate this server exposes the paper's two primitives:
+#     - snapshot_state  (its dspSnapshotCapture): O(1) alias of a live state —
+#       no Lean call at all; parent and snapshot advance independently.
+#     - branch_tactics  (its dspSnapshotBranch): try a whole tactic portfolio
+#       against ONE captured state in a single round-trip; every survivor
+#       becomes its own ghost session.
+#   Lifetime is refcounted: a Lean-side state is goal.delete'd only when the
+#   LAST ledger entry referencing it is freed.
 #
-#   Memory: each worker holds its own copy of Mathlib (~2-4 GB resident).
-#   LEAK2_POOL_SIZE tunes the pool (default 2); set it to 1 to restore the
-#   exact old single-subprocess footprint.
+#   What one subprocess cannot do is EXECUTE two tactics at the same instant —
+#   its stdio protocol has no request ids — so tactic execution interleaves
+#   (each call is typically ms; the paper measures tactic CPU at <0.1% of
+#   branch cost). LEAK2_POOL_SIZE (default 1 — one dynamic daemon powering
+#   the whole army) can add extra subprocesses for true simultaneous tactic
+#   execution at ~2-4 GB RAM each; states stay pinned to their owning worker.
 #
-# Hardened behaviors kept from the previous revision:
-#   - proof_ledger is a bounded LRU (was unbounded -> slow OOM as states leaked).
+# Hardened behaviors kept from previous revisions:
+#   - proof_ledger is a bounded LRU (env LEAK2_LEDGER_MAX, default 2048 —
+#     ghosts are KB, the cap is a leak backstop, not a design limit).
 #   - Workers are warmed in the background so the port opens immediately.
 #   - A dead subprocess self-heals via in-place restart instead of wedging.
-# New in this revision:
-#   - cleanup_memory takes an optional state_id: agents free ONLY their own
-#     state instead of nuking every parallel caller's work (the old global
-#     clear is still available by passing nothing, for single-agent use).
-#   - Lean-side garbage collection: dropped/evicted states now actually get
-#     goal.delete'd in the owning subprocess (server.gc()); previously freed
-#     Python records leaked their Lean goal states forever.
+#   - cleanup_memory(state_id) frees ONLY that ghost; bare call = global clear.
+#   - Lean-side gc actually runs on free/eviction (states used to leak forever).
 # =============================================================================
 
 logging.basicConfig(
@@ -66,8 +73,8 @@ mcp = FastMCP(
 )
 
 TOOL_TIMEOUT = 300.0          # per Pantograph call
-LEDGER_MAX = 256              # max live proof states kept (LRU-evicted)
-POOL_SIZE = max(1, int(os.environ.get("LEAK2_POOL_SIZE", "2")))
+LEDGER_MAX = max(16, int(os.environ.get("LEAK2_LEDGER_MAX", "2048")))
+POOL_SIZE = max(1, int(os.environ.get("LEAK2_POOL_SIZE", "1")))
 
 
 class PantographWorker:
@@ -304,6 +311,82 @@ async def get_current_proof_state(state_id: str) -> str:
         goals = "No goals remaining! The proof is complete."
     return (f"=== LEAN 4 SCRIPT SO FAR ===\n```lean4\n{script}```\n\n"
             f"=== CURRENT OPEN GOALS ===\n{goals}")
+
+
+@mcp.tool()
+async def snapshot_state(state_id: str) -> str:
+    """
+    Capture a live proof state into a NEW independent State ID — instantly,
+    with zero cost (no Lean work happens). The original and the snapshot then
+    advance completely independently: apply different tactics to each, explore
+    risky ideas on one while keeping the other safe, or hand copies to
+    parallel searches. Free each with cleanup_memory when done.
+    """
+    record = _ledger_get(state_id)
+    if record is None:
+        return f"Error: State ID '{state_id}' not found."
+    new_id = str(uuid.uuid4())
+    _ledger_put(new_id, {"state": record["state"], "prop": record["prop"],
+                         "tactics": list(record["tactics"]),
+                         "worker": record.get("worker", 0)})
+    logger.info(f"👻 [SNAP] {state_id[:8]} → {new_id[:8]} (ledger={len(proof_ledger)})")
+    return (f"Snapshot captured. New State ID: {new_id}\n"
+            f"It shares the original's current goals and history; the two now "
+            f"advance independently.")
+
+
+@mcp.tool()
+async def branch_tactics(state_id: str, tactics: "list[str]") -> str:
+    """
+    Try MANY candidate tactics against ONE proof state in a single call (a
+    tactic portfolio). The parent state is not consumed or changed. Every
+    tactic that succeeds becomes its own new State ID you can keep advancing;
+    failures are reported inline. Far cheaper than N separate snapshot +
+    apply_tactic round-trips when you want to race e.g. simp / omega / ring /
+    positivity / aesop against the same goal.
+    """
+    global _op_count
+    record = _ledger_get(state_id)
+    if record is None:
+        return f"Error: State ID '{state_id}' not found."
+    if not tactics:
+        return "Error: pass at least one candidate tactic."
+    worker = _pool[record.get("worker", 0)]
+    parent_state = record["state"]
+    parent_tactics = list(record["tactics"])
+    lines = [f"Branch results for {state_id[:8]} ({len(tactics)} candidates):"]
+    wins = 0
+    for i, tac in enumerate(tactics, 1):
+        _op_count += 1
+        n = _op_count
+        t0 = time.time()
+        logger.info(f"🌿 [#{n} w{worker.idx}] branch[{i}/{len(tactics)}] {state_id[:8]}: {' '.join(tac.split())[:120]}")
+        try:
+            async with worker.lock:
+                new_state = await _call_pantograph(worker, lambda server: server.goal_tactic_async(parent_state, tac))
+            ms = int((time.time() - t0) * 1000)
+            child_id = str(uuid.uuid4())
+            _ledger_put(child_id, {"state": new_state, "prop": record["prop"],
+                                   "tactics": parent_tactics + [tac],
+                                   "worker": worker.idx})
+            state_str = str(new_state).strip()
+            if not state_str or state_str == "no goals":
+                wins += 1
+                script = _assemble_script("auto_proof", record["prop"], parent_tactics + [tac])
+                logger.info(f"🏁 [#{n} w{worker.idx}] branch '{tac[:60]}' COMPLETED the proof in {ms}ms")
+                lines.append(f"[{i}] ✅ {tac} → PROOF COMPLETE ({ms}ms). New State ID: {child_id}\n"
+                             f"Verified script:\n```lean4\n{script}```")
+            else:
+                wins += 1
+                lines.append(f"[{i}] ✅ {tac} → goals remain ({ms}ms). New State ID: {child_id}\n"
+                             f"Goals:\n{state_str}")
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            lines.append(f"[{i}] ❌ {tac} → failed ({ms}ms): {e}")
+    lines.append(f"{wins}/{len(tactics)} candidates advanced. Parent state "
+                 f"'{state_id}' is unchanged and still usable. Free the child "
+                 f"states you don't keep with cleanup_memory.")
+    return "\n".join(lines)
 
 
 @mcp.tool()
