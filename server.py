@@ -15,22 +15,40 @@ from pantograph import Server
 import uvicorn
 
 # =============================================================================
-# Leak PyPantograph service (interactive proof state)
+# Leak PyPantograph service (interactive proof state) — WORKER POOL
 # -----------------------------------------------------------------------------
 # The CONSTRUCTION surface for hard proofs: init_proof gives a goal state, and
 # apply_tactic advances it one tactic at a time, returning the resulting goals —
-# the Lean Infoview as an API. This is what lets an agent grind a decomposed
-# lemma it can't one-shot: apply a tactic, SEE the surviving hypotheses / goal /
-# elaborated signature, adjust. Whole-script checking (verify_full_script) lives
+# the Lean Infoview as an API. Whole-script checking (verify_full_script) lives
 # on the separate LSP-daemon space and remains the trusted final gate; this box
 # is the scratchpad, not the judge.
 #
-# Hardened vs the old combined server:
-#   - ONE Mathlib here (no co-resident LSP daemon) -> no double-load OOM.
-#   - A single lock serialises ALL access to the shared Pantograph subprocess;
-#     concurrent goal_start/goal_tactic used to corrupt its stdio pipes and crash.
+# Parallelism model (the reason for the pool):
+#   Pantograph's wire protocol is one-write-then-one-read on a single stdio
+#   pipe with NO request ids, so a single subprocess can never serve two
+#   concurrent calls — responses would be misattributed or the reader crashes.
+#   Instead of one global lock serialising every caller (the old design), we
+#   run POOL_SIZE independent Pantograph subprocesses. Each worker has its own
+#   lock; every proof state is pinned at init_proof time to the worker that
+#   created it, and all later calls on that state go through that worker's
+#   lock. Callers on DIFFERENT states therefore run truly in parallel, while
+#   any one subprocess still sees strictly serial traffic.
+#
+#   Memory: each worker holds its own copy of Mathlib (~2-4 GB resident).
+#   LEAK2_POOL_SIZE tunes the pool (default 2); set it to 1 to restore the
+#   exact old single-subprocess footprint.
+#
+# Hardened behaviors kept from the previous revision:
 #   - proof_ledger is a bounded LRU (was unbounded -> slow OOM as states leaked).
-#   - Mathlib is warmed in the background so the port opens immediately.
+#   - Workers are warmed in the background so the port opens immediately.
+#   - A dead subprocess self-heals via in-place restart instead of wedging.
+# New in this revision:
+#   - cleanup_memory takes an optional state_id: agents free ONLY their own
+#     state instead of nuking every parallel caller's work (the old global
+#     clear is still available by passing nothing, for single-agent use).
+#   - Lean-side garbage collection: dropped/evicted states now actually get
+#     goal.delete'd in the owning subprocess (server.gc()); previously freed
+#     Python records leaked their Lean goal states forever.
 # =============================================================================
 
 logging.basicConfig(
@@ -48,68 +66,109 @@ mcp = FastMCP(
 
 TOOL_TIMEOUT = 300.0          # per Pantograph call
 LEDGER_MAX = 256              # max live proof states kept (LRU-evicted)
+POOL_SIZE = max(1, int(os.environ.get("LEAK2_POOL_SIZE", "2")))
 
-_lean_server = None
-_lean_lock = asyncio.Lock()   # serialises the single Pantograph subprocess
+
+class PantographWorker:
+    """One Pantograph subprocess + the lock that serialises access to it."""
+
+    def __init__(self, idx: int):
+        self.idx = idx
+        self.server = None            # pantograph.Server, constructed lazily
+        self.lock = asyncio.Lock()    # serialises THIS subprocess only
+
+
+_pool: "list[PantographWorker]" = [PantographWorker(i) for i in range(POOL_SIZE)]
 proof_ledger: "OrderedDict[str, dict]" = OrderedDict()
 _op_count = 0
 
 
-def get_lean_server(force_restart: bool = False):
-    """Lazily construct the Pantograph subprocess (loads Mathlib — slow, once).
+def get_lean_server(worker: PantographWorker, force_restart: bool = False):
+    """Lazily construct a worker's Pantograph subprocess (loads Mathlib — slow,
+    once per worker).
 
     Also self-heals a DEAD subprocess. PyPantograph nulls out `server.proc`
     (via its internal `_close()`) whenever a call times out, hits a decode
     error, or otherwise crashes — expected behavior, and PyPantograph ships
-    `server.restart()` specifically to recover from it. But this function used
-    to only reconstruct when `_lean_server is None`, and the Python *object*
-    stays non-None forever after its first successful construction even once
-    `.proc` dies inside it — so a single timeout (e.g. from a throttled/
-    resource-starved container blowing past the call timeout) permanently
-    wedged every future call with "Server not running." until the whole
-    container was restarted. Now a dead `.proc` triggers an in-place
-    `.restart()` instead of being silently cached forever.
+    `server.restart()` specifically to recover from it. A dead `.proc`
+    triggers an in-place `.restart()` instead of being silently cached
+    forever (which used to wedge every future call until a container restart).
     """
-    global _lean_server
-    if _lean_server is None:
+    if worker.server is None:
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
-        logger.info("🚨 [PANTO] constructing Pantograph Server (loading Mathlib)…")
-        _lean_server = Server(imports=["Mathlib"], project_path=project_dir, timeout=300)
-        logger.info("✅ [PANTO] Pantograph Server ready")
-    elif force_restart or _lean_server.proc is None:
-        logger.warning("♻️  [PANTO] Pantograph subprocess is dead (proc=None) — restarting it")
-        _lean_server.restart()
-        logger.info("✅ [PANTO] Pantograph Server restarted")
-    return _lean_server
+        logger.info(f"🚨 [PANTO w{worker.idx}] constructing Pantograph Server (loading Mathlib)…")
+        worker.server = Server(imports=["Mathlib"], project_path=project_dir, timeout=300)
+        logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server ready")
+    elif force_restart or worker.server.proc is None:
+        logger.warning(f"♻️  [PANTO w{worker.idx}] subprocess is dead (proc=None) — restarting it")
+        worker.server.restart()
+        logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server restarted")
+    return worker.server
 
 
-async def _call_pantograph(fn):
+async def _call_pantograph(worker: PantographWorker, fn):
     """Run fn(server) off the event loop (Pantograph's sync API drives its own
     event loop internally, so it must run off-thread). If the subprocess turns
     out to be dead — a timeout mid-call also nulls `.proc`, so the failure can
     surface on the SAME call that killed it, not just the next one — retry
     ONCE against a freshly restarted server rather than propagating the error.
+
+    Caller MUST hold worker.lock.
     """
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(lambda: fn(get_lean_server())), timeout=TOOL_TIMEOUT
+            asyncio.to_thread(lambda: fn(get_lean_server(worker))), timeout=TOOL_TIMEOUT
         )
     except Exception as e:
         if "Server not running" in str(e):
-            logger.warning("♻️  Pantograph call hit a dead subprocess — restarting and retrying once")
+            logger.warning(f"♻️  [w{worker.idx}] call hit a dead subprocess — restarting and retrying once")
             return await asyncio.wait_for(
-                asyncio.to_thread(lambda: fn(get_lean_server(force_restart=True))),
+                asyncio.to_thread(lambda: fn(get_lean_server(worker, force_restart=True))),
                 timeout=TOOL_TIMEOUT,
             )
         raise
 
 
+def _live_count(idx: int) -> int:
+    return sum(1 for r in proof_ledger.values() if r.get("worker", 0) == idx)
+
+
+def _pick_worker() -> PantographWorker:
+    """Route a NEW proof state to the best worker: prefer warmed subprocesses,
+    then idle (unlocked) ones, then the fewest live states. A cold worker is
+    only chosen while nothing is warmed yet (the boot window), matching the
+    old single-worker behavior of the first call paying the Mathlib load."""
+    warmed = [w for w in _pool if w.server is not None]
+    candidates = warmed if warmed else _pool
+    return min(candidates, key=lambda w: (w.lock.locked(), _live_count(w.idx), w.idx))
+
+
+async def _gc_worker(idx: int):
+    """Best-effort Lean-side garbage collection on one worker. Freed Python
+    GoalStates register their ids in the server's to_remove list; server.gc()
+    sends the actual goal.delete. Never restarts a subprocess just to gc."""
+    w = _pool[idx]
+    if w.server is None or w.server.proc is None:
+        return
+    try:
+        async with w.lock:
+            if w.server is None or w.server.proc is None:
+                return
+            await asyncio.wait_for(asyncio.to_thread(w.server.gc), timeout=60)
+    except Exception as e:
+        logger.warning(f"⚠️  [w{idx}] Lean-side gc failed (non-fatal): {e}")
+
+
 def _ledger_put(state_id: str, record: dict):
     proof_ledger[state_id] = record
     proof_ledger.move_to_end(state_id)
+    evicted_workers = set()
     while len(proof_ledger) > LEDGER_MAX:
-        old, _ = proof_ledger.popitem(last=False)
+        old, old_rec = proof_ledger.popitem(last=False)
+        evicted_workers.add(old_rec.get("worker", 0))
         logger.info(f"🧹 [LEDGER] evicted oldest state {old[:8]} (cap {LEDGER_MAX})")
+    for idx in evicted_workers:
+        asyncio.get_running_loop().create_task(_gc_worker(idx))
 
 
 def _ledger_get(state_id: str):
@@ -128,26 +187,29 @@ async def init_proof(proposition: str) -> str:
     Start a new interactive proof state for a proposition.
     Provide ONLY the proposition (no 'theorem name :' and no ':=' / 'by').
     Returns a State ID plus the current goal(s); advance it with apply_tactic.
+    Parallel-safe: independent State IDs can be worked concurrently.
     """
     global _op_count
     _op_count += 1
     n = _op_count
     state_id = str(uuid.uuid4())
+    worker = _pick_worker()
     preview = " ".join(proposition.split())[:200]
     logger.info("─" * 60)
-    logger.info(f"🎯 [#{n}] init_proof: {preview}")
+    logger.info(f"🎯 [#{n} w{worker.idx}] init_proof: {preview}")
     t0 = time.time()
     try:
-        async with _lean_lock:
-            # The lock guarantees only one call (including a self-heal retry)
-            # touches the subprocess at a time.
-            goal_state = await _call_pantograph(lambda server: server.goal_start(proposition))
-        _ledger_put(state_id, {"state": goal_state, "prop": proposition, "tactics": []})
-        logger.info(f"✅ [#{n}] initialised {state_id[:8]} in "
+        async with worker.lock:
+            # The worker's lock guarantees only one call (including a
+            # self-heal retry) touches ITS subprocess at a time.
+            goal_state = await _call_pantograph(worker, lambda server: server.goal_start(proposition))
+        _ledger_put(state_id, {"state": goal_state, "prop": proposition,
+                               "tactics": [], "worker": worker.idx})
+        logger.info(f"✅ [#{n} w{worker.idx}] initialised {state_id[:8]} in "
                     f"{int((time.time()-t0)*1000)}ms  (ledger={len(proof_ledger)})")
         return f"Proof initialized. State ID: {state_id}\nCurrent Goal(s):\n{goal_state}"
     except Exception as e:
-        logger.error(f"💥 [#{n}] init_proof failed: {e}")
+        logger.error(f"💥 [#{n} w{worker.idx}] init_proof failed: {e}")
         return f"Error initializing proof: {e}"
 
 
@@ -164,12 +226,13 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
     if record is None:
         logger.info(f"↩️  [#{n}] apply_tactic: unknown state {state_id[:8]}")
         return f"Error: State ID '{state_id}' not found. You may need to re-initialise your proof."
+    worker = _pool[record.get("worker", 0)]
 
-    logger.info(f"🔧 [#{n}] apply_tactic {state_id[:8]}: {' '.join(tactic.split())[:160]}")
+    logger.info(f"🔧 [#{n} w{worker.idx}] apply_tactic {state_id[:8]}: {' '.join(tactic.split())[:160]}")
     t0 = time.time()
     try:
-        async with _lean_lock:
-            new_state = await _call_pantograph(lambda server: server.goal_tactic(record["state"], tactic))
+        async with worker.lock:
+            new_state = await _call_pantograph(worker, lambda server: server.goal_tactic(record["state"], tactic))
         record["state"] = new_state
         record["tactics"].append(tactic)
         _ledger_put(state_id, record)
@@ -179,13 +242,13 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
             script = f"theorem auto_proof : {record['prop']} := by\n"
             for tac in record["tactics"]:
                 script += f"  {tac}\n"
-            logger.info(f"🏁 [#{n}] proof complete for {state_id[:8]} in {ms}ms")
+            logger.info(f"🏁 [#{n} w{worker.idx}] proof complete for {state_id[:8]} in {ms}ms")
             return ("Tactic succeeded! Proof complete. No goals remaining.\n\n"
                     f"Verified script:\n```lean4\n{script}```")
-        logger.info(f"✅ [#{n}] tactic ok in {ms}ms; goals remain")
+        logger.info(f"✅ [#{n} w{worker.idx}] tactic ok in {ms}ms; goals remain")
         return f"Tactic succeeded. New Goals:\n{state_str}"
     except Exception as e:
-        logger.info(f"❌ [#{n}] tactic failed: {e}")
+        logger.info(f"❌ [#{n} w{worker.idx}] tactic failed: {e}")
         return f"Tactic failed: {e}"
 
 
@@ -211,11 +274,30 @@ async def get_current_proof_state(state_id: str) -> str:
 
 
 @mcp.tool()
-async def cleanup_memory() -> str:
-    """Clear all saved proof states to free RAM. Call when switching problems."""
+async def cleanup_memory(state_id: str = "") -> str:
+    """
+    Free proof states to release RAM.
+    Pass the state_id of a state YOU created to free just that one — always do
+    this when you're finished with a state, and never touch ids you don't own.
+    Calling with NO state_id clears EVERY state on the server; only do that
+    when you know no one else is proving in parallel.
+    """
+    if state_id:
+        record = proof_ledger.pop(state_id, None)
+        if record is None:
+            return f"State ID '{state_id}' not found (already freed or never existed)."
+        idx = record.get("worker", 0)
+        del record
+        asyncio.get_running_loop().create_task(_gc_worker(idx))
+        logger.info(f"🧹 [LEDGER] freed state {state_id[:8]} (ledger={len(proof_ledger)})")
+        return f"State '{state_id}' freed. Other states are untouched."
+
     count = len(proof_ledger)
+    touched = {r.get("worker", 0) for r in proof_ledger.values()}
     proof_ledger.clear()
-    logger.info(f"🧹 [LEDGER] cleared {count} states on request")
+    for idx in touched:
+        asyncio.get_running_loop().create_task(_gc_worker(idx))
+    logger.info(f"🧹 [LEDGER] cleared {count} states on request (global)")
     return f"Memory cleared. {count} previous state ID(s) are now invalid."
 
 
@@ -223,24 +305,26 @@ async def cleanup_memory() -> str:
 # BOOT
 # =============================================================================
 async def _warmup():
-    logger.info("⏳ Warmup: constructing Pantograph + loading Mathlib "
-                "(first load can take a while on a small CPU)…")
-    try:
-        # Building the Server loads Mathlib; do a trivial goal to force it fully.
-        async with _lean_lock:
-            await asyncio.to_thread(lambda: get_lean_server().goal_start("True"))
-        logger.info("✅ Warmup complete — Pantograph + Mathlib resident.")
-    except Exception as e:
-        logger.error(f"⚠️  Warmup did not finish: {e}")
+    """Warm every worker sequentially in the background. The port opens
+    immediately (HF marks healthy); each worker's lock makes real calls wait
+    behind that worker's own warmup only."""
+    for w in _pool:
+        logger.info(f"⏳ Warmup w{w.idx}: constructing Pantograph + loading Mathlib "
+                    "(first load can take a while on a small CPU)…")
+        try:
+            # Building the Server loads Mathlib; a trivial goal forces it fully.
+            async with w.lock:
+                await asyncio.to_thread(lambda w=w: get_lean_server(w).goal_start("True"))
+            logger.info(f"✅ Warmup w{w.idx} complete — Pantograph + Mathlib resident.")
+        except Exception as e:
+            logger.error(f"⚠️  Warmup w{w.idx} did not finish: {e}")
 
 
 async def main_serve():
     logger.info("=" * 60)
-    logger.info("Booting Leak PyPantograph service…")
+    logger.info(f"Booting Leak PyPantograph service… (pool size: {POOL_SIZE})")
     logger.info("=" * 60)
 
-    # Warm in the background so the port opens immediately (HF marks healthy);
-    # the lock makes the first real init_proof wait behind the warmup.
     asyncio.create_task(_warmup())
 
     http_app = mcp.sse_app()
