@@ -72,9 +72,29 @@ mcp = FastMCP(
     ),
 )
 
-TOOL_TIMEOUT = 300.0          # per Pantograph call
+# Per-call watchdog. Kept ABOVE PyPantograph's own per-read timeout (300s,
+# set at Server.create) so that a genuinely hung read is killed by the INNER
+# timeout first — which also terminates the subprocess, leaving a clean slate.
+# The outer watchdog then only fires for multi-round-trip calls, and when it
+# does the pipe is treated as dirty (see _call_pantograph).
+TOOL_TIMEOUT = 310.0
+GC_TIMEOUT = 60.0             # per Lean-side gc pass
 LEDGER_MAX = max(16, int(os.environ.get("LEAK2_LEDGER_MAX", "2048")))
 POOL_SIZE = max(1, int(os.environ.get("LEAK2_POOL_SIZE", "1")))
+
+
+class StaleProofState(Exception):
+    """The referenced proof state lived in a Lean subprocess that has since
+    been restarted. Its Lean-side goal state is gone, and its integer state id
+    may now ALIAS a fresh state in the new subprocess — so touching it would
+    silently operate on the wrong proof. Callers surface this as an ordinary
+    tool error telling the agent to re-initialise."""
+
+    def __init__(self):
+        super().__init__(
+            "this proof state was lost when its Lean subprocess restarted — "
+            "re-initialise it with init_proof and re-apply your tactics"
+        )
 
 
 class PantographWorker:
@@ -84,6 +104,20 @@ class PantographWorker:
         self.idx = idx
         self.server = None            # pantograph.Server, constructed lazily
         self.lock = asyncio.Lock()    # serialises THIS subprocess only
+        # Pipe-sync bookkeeping. Pantograph's stdio protocol has NO request
+        # ids: every command write must be matched by exactly one response
+        # read, in order. A call that dies BETWEEN its write and its read
+        # (client disconnect cancelling the task, or a watchdog timeout while
+        # the subprocess is still computing) leaves that response in the pipe
+        # — after which every later call reads its predecessor's response:
+        # crossed goals, KeyError('stateId'), "'NoneType' object is not
+        # iterable". `dirty` marks exactly that situation; the next call (and
+        # an eager background healer) restarts the subprocess for a clean
+        # stream. `gen` counts restarts so ledger records minted against an
+        # older subprocess can never be replayed against a newer one, where
+        # Pantograph's sequential integer state ids would ALIAS fresh states.
+        self.dirty = False
+        self.gen = 0
 
 
 _pool: "list[PantographWorker]" = [PantographWorker(i) for i in range(POOL_SIZE)]
@@ -123,23 +157,120 @@ async def get_lean_server(worker: PantographWorker, force_restart: bool = False)
     return worker.server
 
 
-async def _call_pantograph(worker: PantographWorker, coro_fn):
-    """Await coro_fn(server) with a timeout. If the subprocess turns out to be
-    dead — a timeout mid-call also nulls `.proc`, so the failure can surface
-    on the SAME call that killed it, not just the next one — retry ONCE
-    against a freshly restarted server rather than propagating the error.
+def _purge_worker_states(idx: int) -> int:
+    """Drop every ledger record living on worker `idx`. Their Lean-side goal
+    states died with (or are unreachable in) that worker's subprocess, and
+    Pantograph's sequential integer state ids mean a stale record replayed
+    against a NEW subprocess could silently act on the wrong proof."""
+    stale = [sid for sid, r in proof_ledger.items() if r.get("worker", 0) == idx]
+    for sid in stale:
+        del proof_ledger[sid]
+    return len(stale)
 
-    Caller MUST hold worker.lock.
+
+async def _restart_worker_clean(worker: PantographWorker, reason: str):
+    """Restart a worker's subprocess and reconcile ALL bookkeeping that refers
+    to the old one. Caller MUST hold worker.lock.
+
+    Order matters:
+      1. Purge the worker's ledger records FIRST — dropping the last Python
+         reference to each GoalState runs its __del__, which queues its (old)
+         integer id on server.to_remove_goal_states.
+      2. Restart the subprocess (kills the old proc → provably clean pipe).
+      3. Clear to_remove_goal_states — those queued ids belong to the DEAD
+         process; sending goal.delete for them to the new one could delete
+         aliased fresh states.
     """
+    n_purged = _purge_worker_states(worker.idx)
+    logger.warning(f"♻️  [w{worker.idx}] {reason} — restarting subprocess for a clean stream"
+                   + (f"; purged {n_purged} ledger state(s) that lived in it" if n_purged else ""))
+    await get_lean_server(worker, force_restart=True)
     try:
-        server = await get_lean_server(worker)
-        return await asyncio.wait_for(coro_fn(server), timeout=TOOL_TIMEOUT)
+        worker.server.to_remove_goal_states.clear()
+    except Exception:
+        pass
+    worker.gen += 1
+    worker.dirty = False
+    logger.info(f"✅ [w{worker.idx}] clean restart complete (gen={worker.gen})")
+
+
+async def _heal_worker(idx: int):
+    """Eagerly restart a dirty worker in the background so the cost is paid
+    while nothing needs it, instead of stalling the next real call. Purely an
+    optimisation: _call_pantograph re-checks `dirty` under the lock anyway."""
+    w = _pool[idx]
+    try:
+        async with w.lock:
+            if w.dirty:
+                await _restart_worker_clean(w, "healing a dirty pipe eagerly")
     except Exception as e:
-        if "Server not running" in str(e):
-            logger.warning(f"♻️  [w{worker.idx}] call hit a dead subprocess — restarting and retrying once")
-            server = await get_lean_server(worker, force_restart=True)
+        # Leave `dirty` set — the next real call retries the restart.
+        logger.warning(f"⚠️  [w{idx}] eager heal failed (will retry on next use): {e}")
+
+
+def _mark_dirty(worker: PantographWorker, why: str):
+    worker.dirty = True
+    logger.warning(f"🩸 [w{worker.idx}] pipe marked dirty ({why}) — next use restarts the subprocess")
+    try:
+        asyncio.get_running_loop().create_task(_heal_worker(worker.idx))
+    except RuntimeError:
+        pass  # no running loop (shutdown) — the lazy path still heals
+
+
+async def _call_pantograph(worker: PantographWorker, coro_fn, record: "dict | None" = None):
+    """Await coro_fn(server) with a watchdog. Caller MUST hold worker.lock.
+    `record` is the ledger record whose GoalState coro_fn touches (None for
+    stateless calls like goal.start).
+
+    PIPE-SYNC GUARANTEE — the invariant this function exists to protect:
+    Pantograph's stdio protocol has no request ids, so one command write must
+    be matched by exactly one response read, in order. Any call that exits
+    uncleanly BETWEEN a write and its read (task cancelled because the MCP
+    client vanished mid-call, watchdog timeout while the subprocess is still
+    computing, or a shape error proving we just consumed someone else's
+    response) marks the worker DIRTY. The next call — or the eager healer —
+    restarts the subprocess (clean pipe), purges the worker's now-dead ledger
+    states, and bumps `gen` so no stale record can ever be replayed against
+    the new process. Clean Lean-level failures (TacticFailure, ServerError
+    carrying a parsed payload) completed their read and do NOT dirty anything.
+    """
+    if worker.dirty:
+        await _restart_worker_clean(worker, "pipe was marked dirty by an interrupted call")
+    if record is not None and record.get("gen", worker.gen) != worker.gen:
+        raise StaleProofState()
+    for attempt in (0, 1):
+        try:
+            server = await get_lean_server(worker)
             return await asyncio.wait_for(coro_fn(server), timeout=TOOL_TIMEOUT)
-        raise
+        except asyncio.TimeoutError:
+            # Watchdog fired: the command was written, its response never
+            # read, and the subprocess may still be computing. Classic dirty.
+            _mark_dirty(worker, "watchdog timeout mid-call")
+            raise
+        except asyncio.CancelledError:
+            # The MCP client vanished mid-call (e.g. an epoch abort killing a
+            # minion). Same written-but-unread situation. Cancellation is
+            # control flow — mark and re-raise, never swallow.
+            _mark_dirty(worker, "call cancelled mid-flight")
+            raise
+        except Exception as e:
+            if "Server not running" in str(e) and attempt == 0:
+                # PyPantograph nulled .proc itself (its own timeout/decode
+                # paths call _close()) — the pipe died WITH the process, so
+                # this is a clean restart, not a dirty one. But any GoalState
+                # minted before the death is gone: stateless calls retry once
+                # against the fresh server; stateful ones must re-initialise.
+                await _restart_worker_clean(worker, "call hit a dead subprocess")
+                if record is not None:
+                    raise StaleProofState() from e
+                continue
+            # A shape error out of response parsing (KeyError('stateId'),
+            # "'NoneType' object is not iterable", …) means the read COMPLETED
+            # but with someone else's response — the stream is already crossed
+            # and our own response is still in the pipe. Heal on next use.
+            if isinstance(e, (KeyError, TypeError, IndexError, AttributeError)):
+                _mark_dirty(worker, f"response shape mismatch: {type(e).__name__}: {e}")
+            raise
 
 
 def _live_count(idx: int) -> int:
@@ -159,15 +290,25 @@ def _pick_worker() -> PantographWorker:
 async def _gc_worker(idx: int):
     """Best-effort Lean-side garbage collection on one worker. Freed Python
     GoalStates register their ids in the server's to_remove list; server.gc()
-    sends the actual goal.delete. Never restarts a subprocess just to gc."""
+    sends the actual goal.delete. Never restarts a subprocess just to gc.
+
+    gc is a real write+read on the same request-id-less pipe as everything
+    else, so it obeys the same pipe-sync rules: never gc a dirty pipe (that
+    would deepen the desync), and a gc interrupted mid-call dirties the pipe
+    exactly like an interrupted tactic would."""
     w = _pool[idx]
-    if w.server is None or w.server.proc is None:
+    if w.server is None or w.server.proc is None or w.dirty:
         return
     try:
         async with w.lock:
-            if w.server is None or w.server.proc is None:
+            if w.server is None or w.server.proc is None or w.dirty:
                 return
-            await asyncio.wait_for(w.server.gc_async(), timeout=60)
+            await asyncio.wait_for(w.server.gc_async(), timeout=GC_TIMEOUT)
+    except asyncio.TimeoutError:
+        _mark_dirty(w, "gc watchdog timeout mid-call")
+    except asyncio.CancelledError:
+        _mark_dirty(w, "gc cancelled mid-flight")
+        raise
     except Exception as e:
         logger.warning(f"⚠️  [w{idx}] Lean-side gc failed (non-fatal): {e}")
 
@@ -248,7 +389,8 @@ async def init_proof(proposition: str) -> str:
             # self-heal retry) touches ITS subprocess at a time.
             goal_state = await _call_pantograph(worker, lambda server: server.goal_start_async(proposition))
         _ledger_put(state_id, {"state": goal_state, "prop": proposition,
-                               "tactics": [], "worker": worker.idx})
+                               "tactics": [], "worker": worker.idx,
+                               "gen": worker.gen})
         logger.info(f"✅ [#{n} w{worker.idx}] initialised {state_id[:8]} in "
                     f"{int((time.time()-t0)*1000)}ms  (ledger={len(proof_ledger)})")
         return f"Proof initialized. State ID: {state_id}\nCurrent Goal(s):\n{goal_state}"
@@ -276,7 +418,7 @@ async def apply_tactic(state_id: str, tactic: str) -> str:
     t0 = time.time()
     try:
         async with worker.lock:
-            new_state = await _call_pantograph(worker, lambda server: server.goal_tactic_async(record["state"], tactic))
+            new_state = await _call_pantograph(worker, lambda server: server.goal_tactic_async(record["state"], tactic), record=record)
         record["state"] = new_state
         record["tactics"].append(tactic)
         _ledger_put(state_id, record)
@@ -328,7 +470,8 @@ async def snapshot_state(state_id: str) -> str:
     new_id = str(uuid.uuid4())
     _ledger_put(new_id, {"state": record["state"], "prop": record["prop"],
                          "tactics": list(record["tactics"]),
-                         "worker": record.get("worker", 0)})
+                         "worker": record.get("worker", 0),
+                         "gen": record.get("gen", _pool[record.get("worker", 0)].gen)})
     logger.info(f"👻 [SNAP] {state_id[:8]} → {new_id[:8]} (ledger={len(proof_ledger)})")
     return (f"Snapshot captured. New State ID: {new_id}\n"
             f"It shares the original's current goals and history; the two now "
@@ -363,12 +506,12 @@ async def branch_tactics(state_id: str, tactics: "list[str]") -> str:
         logger.info(f"🌿 [#{n} w{worker.idx}] branch[{i}/{len(tactics)}] {state_id[:8]}: {' '.join(tac.split())[:120]}")
         try:
             async with worker.lock:
-                new_state = await _call_pantograph(worker, lambda server: server.goal_tactic_async(parent_state, tac))
+                new_state = await _call_pantograph(worker, lambda server: server.goal_tactic_async(parent_state, tac), record=record)
             ms = int((time.time() - t0) * 1000)
             child_id = str(uuid.uuid4())
             _ledger_put(child_id, {"state": new_state, "prop": record["prop"],
                                    "tactics": parent_tactics + [tac],
-                                   "worker": worker.idx})
+                                   "worker": worker.idx, "gen": worker.gen})
             state_str = str(new_state).strip()
             if not state_str or state_str == "no goals":
                 wins += 1
