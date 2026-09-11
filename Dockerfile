@@ -42,9 +42,13 @@ ENV PATH="${HOME}/app/.venv/bin:${PATH}"
 # FastMCP` import.
 RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 
-# Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv
+# Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv.
+# Pinned to our fork, not upstream stanford-centaur/PyPantograph: upstream's
+# main branch still freezes the Pantograph submodule at the v4.29.1-era commit
+# (842c0fe); our fork bumps it to Pantograph v0.3.19 (Lean v4.33.1), which is
+# what lets this build track the same toolchain as the rest of the fleet.
 WORKDIR ${HOME}/PyPantograph
-RUN git clone --recurse-submodules https://github.com/stanford-centaur/PyPantograph.git .
+RUN git clone --recurse-submodules https://github.com/competemath/PyPantograph.git .
 
 RUN cp ${HOME}/app/lean-toolchain ./src/lean-toolchain
 RUN python3 build-pantograph.py
