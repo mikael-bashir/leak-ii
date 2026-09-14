@@ -1,72 +1,44 @@
-# 1. Base Image
 FROM ubuntu:22.04
 
-# 2. CREATE THE GUEST USER (Required for Hugging Face Spaces permissions)
 RUN useradd -m -u 1000 user
-
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
-
-# 3. Install System Dependencies
-# Added python3-venv and cmake (needed to compile PyPantograph's C++ bindings)
 RUN apt-get update && apt-get install -y \
-    curl git build-essential python3 python3-pip python3-venv cmake tzdata && \
+    curl git build-essential python3 python3-pip python3-venv cmake tzdata zstd && \
     rm -rf /var/lib/apt/lists/*
 
-# 4. Switch to the unprivileged user
 USER user
 ENV HOME=/home/user
-# Put elan (Lean) and uv in the PATH
 ENV PATH="${HOME}/.local/bin:${HOME}/.elan/bin:${PATH}"
-
-# 5. Install Lean (elan) & Python package manager (uv)
 RUN curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+WORKDIR ${HOME}
 
-# 6. Setup Workspace & Copy Files
-# NOTE: Your local directory being copied MUST contain your 'server.py', 'lakefile.lean', and 'lean-toolchain'
+# The environment every Pantograph worker loads is the Tengoku tree — one
+# self-contained Lean 4 library seeded from Mathlib and other open libraries,
+# plus every verified addition — pinned to its newest published build cache so
+# nothing compiles. Changing TENGOKU_REFRESH re-clones on a rebuild instead of
+# reusing a stale cached clone layer.
+ARG TENGOKU_REFRESH=0
+RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh
+ENV LEAN_PROJECT_PATH=${HOME}/tengoku
+ENV TENGOKU_IMPORTS="Tengoku.All"
+
+# Python app + PyPantograph, whose repl is built on the tree's toolchain
 WORKDIR ${HOME}/app
 COPY --chown=user . ${HOME}/app
-
-# So that file watcher doesn't crash, and to avoid permission errors later
-RUN touch ${HOME}/app/virtual_sandbox.lean
-
-# 7. Setup Python Virtual Environment & Install Dependencies
-# Create a venv directly in the app folder and add it to the PATH
 RUN uv python install 3.11
 RUN uv venv --python 3.11 ${HOME}/app/.venv
 ENV PATH="${HOME}/app/.venv/bin:${PATH}"
-
-# Install FastMCP. "mcp<2" pinned: mcp 2.x renamed FastMCP to MCPServer and
-# changed its API, breaking server.py's `from mcp.server.fastmcp import
-# FastMCP` import.
 RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 
-# Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv.
-# Pinned to our fork, not upstream stanford-centaur/PyPantograph: upstream's
-# main branch still freezes the Pantograph submodule at the v4.29.1-era commit
-# (842c0fe); our fork bumps it to Pantograph v0.3.19 (Lean v4.33.1), which is
-# what lets this build track the same toolchain as the rest of the fleet.
 WORKDIR ${HOME}/PyPantograph
 RUN git clone --recurse-submodules https://github.com/competemath/PyPantograph.git .
-
-RUN cp ${HOME}/app/lean-toolchain ./src/lean-toolchain
+RUN cp ${HOME}/tengoku/lean-toolchain ./src/lean-toolchain
 RUN python3 build-pantograph.py
 RUN uv pip install .
 
-# 8. Setup Lean Mathlib Cache
 WORKDIR ${HOME}/app
-
-RUN lake update
-
-# CRITICAL: Fetch pre-compiled Mathlib binaries during the image build.
-# If you skip this, your first FastMCP request will hang for 3 hours compiling math.
-RUN lake exe cache get
-RUN lake build
-
-# 9. Environment Variables
 EXPOSE 7860
-
-# 10. Boot the server using the virtual environment
-# Because we added the venv to the PATH in step 7, 'python3' will automatically use it.
 CMD ["python3", "server.py"]
