@@ -27,7 +27,7 @@ import uvicorn
 # Execution model — proof-state snapshotting (after Shen & Shi, "Keep the
 # Proof State Live", arXiv:2605.25556):
 #   Lean proof state has two parts with wildly different costs. The
-#   Environment (all of Mathlib, ~2-4 GB) is immutable and loaded ONCE into
+#   Environment (the whole Tengoku tree, ~3 GB resident) is immutable and loaded ONCE into
 #   the resident daemon; the per-proof state (open goals, metavariables) is
 #   kilobytes. Pantograph's goal states are PERSISTENT: applying a tactic
 #   yields a NEW state id while the parent stays alive and reusable. So an
@@ -81,6 +81,10 @@ TOOL_TIMEOUT = 310.0
 GC_TIMEOUT = 60.0             # per Lean-side gc pass
 LEDGER_MAX = max(16, int(os.environ.get("LEAK2_LEDGER_MAX", "2048")))
 POOL_SIZE = max(1, int(os.environ.get("LEAK2_POOL_SIZE", "1")))
+# The Lean project every worker loads: the Tengoku tree, pinned to its newest
+# published build cache (see Dockerfile / scripts/pin.sh in the tree).
+TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
+TENGOKU_IMPORTS = [m for m in os.environ.get("TENGOKU_IMPORTS", "Tengoku.All").replace(",", " ").split() if m]
 
 
 class StaleProofState(Exception):
@@ -126,7 +130,7 @@ _op_count = 0
 
 
 async def get_lean_server(worker: PantographWorker, force_restart: bool = False):
-    """Lazily construct a worker's Pantograph subprocess (loads Mathlib — slow,
+    """Lazily construct a worker's Pantograph subprocess (loads the tree — slow,
     once per worker) using PyPantograph's ASYNC constructor on the main loop.
 
     Why async-only: PyPantograph's sync API (`to_sync`) drives one shared
@@ -145,9 +149,9 @@ async def get_lean_server(worker: PantographWorker, force_restart: bool = False)
     """
     if worker.server is None:
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
-        logger.info(f"🚨 [PANTO w{worker.idx}] constructing Pantograph Server (loading Mathlib)…")
+        logger.info(f"🚨 [PANTO w{worker.idx}] constructing Pantograph Server (loading the Tengoku tree)…")
         worker.server = await Server.create(
-            imports=["Mathlib"], project_path=project_dir, timeout=300
+            imports=TENGOKU_IMPORTS, project_path=project_dir, timeout=300
         )
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server ready")
     elif force_restart or worker.server.proc is None:
@@ -281,7 +285,7 @@ def _pick_worker() -> PantographWorker:
     """Route a NEW proof state to the best worker: prefer warmed subprocesses,
     then idle (unlocked) ones, then the fewest live states. A cold worker is
     only chosen while nothing is warmed yet (the boot window), matching the
-    old single-worker behavior of the first call paying the Mathlib load."""
+    old single-worker behavior of the first call paying the tree load."""
     warmed = [w for w in _pool if w.server is not None]
     candidates = warmed if warmed else _pool
     return min(candidates, key=lambda w: (w.lock.locked(), _live_count(w.idx), w.idx))
@@ -560,6 +564,118 @@ async def cleanup_memory(state_id: str = "") -> str:
     return f"Memory cleared. {count} previous state ID(s) are now invalid."
 
 
+# --- Tree refresh -------------------------------------------------------------
+# One implementation behind three doors: the `tengoku_sync` MCP tool, the
+# POST /refresh endpoint the nightly cache workflow calls, and the check at
+# start-up. `scripts/pin.sh` (in the tree) pins the tree to its newest
+# published cache; every resident Pantograph is then restarted clean, since
+# it loaded the old environment (its goal states die with it).
+_refresh = {"running": False, "last_post": 0.0, "last": ""}
+# TENGOKU_AUTO_REFRESH=0 turns every door off: for an instance that runs on a
+# developer's working tree (which must never be checked out or overwritten).
+AUTO_REFRESH = os.environ.get("TENGOKU_AUTO_REFRESH", "1") != "0"
+
+
+async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return -1, f"timed out after {timeout:.0f}s: {' '.join(cmd)}"
+    return proc.returncode, out.decode("utf-8", errors="replace")
+
+
+async def _tree_check() -> tuple[str, str]:
+    """('current' | 'newer' | 'unknown', sha-or-detail) — changes nothing."""
+    rc, out = await _run(["scripts/pin.sh", "--check"], TENGOKU_DIR, 300)
+    last = out.strip().splitlines()[-1] if out.strip() else ""
+    parts = last.split()
+    if rc in (0, 3) and len(parts) == 2 and parts[0] in ("current", "newer"):
+        return parts[0], parts[1]
+    return "unknown", last[:200]
+
+
+async def _tengoku_sync() -> str:
+    if _refresh["running"]:
+        return "⏳ tengoku_sync: a refresh is already running"
+    _refresh["running"] = True
+    try:
+        before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+        rc, out = await _run(["scripts/pin.sh"], TENGOKU_DIR, 3600)
+        tail = out.strip().splitlines()[-1] if out.strip() else ""
+        if rc != 0:
+            _refresh["last"] = f"failed: {tail}"
+            return "❌ tengoku_sync: could not pin the tree to the newest cache\n" + out[-2000:]
+        after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+        restarted = 0
+        for w in _pool:
+            async with w.lock:
+                if w.server is not None:
+                    await _restart_worker_clean(w, "tree refreshed")
+                    restarted += 1
+        _refresh["last"] = f"{before} → {after}"
+        return (f"✅ tengoku_sync: tree {before} → {after} ({tail}); {restarted} resident Pantograph worker(s) "
+                "restarted on the refreshed tree — every earlier state id is invalid.")
+    finally:
+        _refresh["running"] = False
+
+
+@mcp.tool()
+async def tengoku_sync() -> str:
+    """
+    Move this proof-state daemon onto the newest published Tengoku build cache:
+    pin the tree to that cache's commit, unpack it (nothing is compiled) and
+    restart every resident Pantograph on it. Every earlier state id becomes
+    invalid. A tree already at the newest cache is a no-op.
+    """
+    if not AUTO_REFRESH:
+        return "⛔ tengoku_sync is disabled on this instance (TENGOKU_AUTO_REFRESH=0: it runs on a working tree)."
+    return await _tengoku_sync()
+
+
+async def _refresh_endpoint(request):
+    """GET: is a newer cache published than the one loaded? POST: if so, refresh
+    in the background. Public on purpose: it can only ever move the tree to a
+    cache competemath/tengoku has PUBLISHED, so the most a stranger can do is
+    make this server look at GitHub once every five minutes."""
+    from starlette.responses import JSONResponse
+    head = (await _run(["git", "rev-parse", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+    if request.method == "GET":
+        status, sha = await _tree_check()
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "last": _refresh["last"]})
+    if not AUTO_REFRESH:
+        return JSONResponse({"status": "disabled", "pinned": head}, status_code=403)
+    if _refresh["running"]:
+        return JSONResponse({"status": "busy", "pinned": head}, status_code=409)
+    now = time.time()
+    if now - _refresh["last_post"] < 300:
+        return JSONResponse({"status": "cooldown", "pinned": head}, status_code=429)
+    _refresh["last_post"] = now
+    status, sha = await _tree_check()
+    if status != "newer":
+        return JSONResponse({"status": status, "pinned": head, "newest": sha})
+    asyncio.create_task(_tengoku_sync())
+    return JSONResponse({"status": "refreshing", "pinned": head, "newest": sha}, status_code=202)
+
+
+async def _startup():
+    """At start: if a newer cache was published since this image was built (a
+    nightly went by while the Space slept), move onto it before warming up."""
+    if not AUTO_REFRESH:
+        logger.info("🌳 Tree auto-refresh is off (TENGOKU_AUTO_REFRESH=0)")
+        await _warmup()
+        return
+    status, sha = await _tree_check()
+    if status == "newer":
+        logger.info(f"🌱 A newer Tengoku cache is published ({sha[:12]}) — refreshing before warm-up…")
+        logger.info((await _tengoku_sync()).splitlines()[0])
+    else:
+        logger.info(f"🌳 Tree check: {status} {sha[:12]}")
+    await _warmup()
+
+
 # =============================================================================
 # BOOT
 # =============================================================================
@@ -568,14 +684,14 @@ async def _warmup():
     immediately (HF marks healthy); each worker's lock makes real calls wait
     behind that worker's own warmup only."""
     for w in _pool:
-        logger.info(f"⏳ Warmup w{w.idx}: constructing Pantograph + loading Mathlib "
+        logger.info(f"⏳ Warmup w{w.idx}: constructing Pantograph + loading the Tengoku tree "
                     "(first load can take a while on a small CPU)…")
         try:
-            # Building the Server loads Mathlib; a trivial goal forces it fully.
+            # Building the Server loads the tree; a trivial goal forces it fully.
             async with w.lock:
                 server = await get_lean_server(w)
                 await server.goal_start_async("True")
-            logger.info(f"✅ Warmup w{w.idx} complete — Pantograph + Mathlib resident.")
+            logger.info(f"✅ Warmup w{w.idx} complete — Pantograph + Tengoku resident.")
         except Exception as e:
             logger.error(f"⚠️  Warmup w{w.idx} did not finish: {e}")
 
@@ -585,9 +701,10 @@ async def main_serve():
     logger.info(f"Booting Leak PyPantograph service… (pool size: {POOL_SIZE})")
     logger.info("=" * 60)
 
-    asyncio.create_task(_warmup())
+    asyncio.create_task(_startup())
 
     http_app = mcp.sse_app()
+    http_app.add_route("/refresh", _refresh_endpoint, methods=["GET", "POST"])
     http_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
