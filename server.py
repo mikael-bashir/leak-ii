@@ -27,7 +27,7 @@ import uvicorn
 # Execution model — proof-state snapshotting (after Shen & Shi, "Keep the
 # Proof State Live", arXiv:2605.25556):
 #   Lean proof state has two parts with wildly different costs. The
-#   Environment (all of Mathlib, ~2-4 GB) is immutable and loaded ONCE into
+#   Environment (the whole Tengoku tree, ~3 GB resident) is immutable and loaded ONCE into
 #   the resident daemon; the per-proof state (open goals, metavariables) is
 #   kilobytes. Pantograph's goal states are PERSISTENT: applying a tactic
 #   yields a NEW state id while the parent stays alive and reusable. So an
@@ -285,7 +285,7 @@ def _pick_worker() -> PantographWorker:
     """Route a NEW proof state to the best worker: prefer warmed subprocesses,
     then idle (unlocked) ones, then the fewest live states. A cold worker is
     only chosen while nothing is warmed yet (the boot window), matching the
-    old single-worker behavior of the first call paying the Mathlib load."""
+    old single-worker behavior of the first call paying the tree load."""
     warmed = [w for w in _pool if w.server is not None]
     candidates = warmed if warmed else _pool
     return min(candidates, key=lambda w: (w.lock.locked(), _live_count(w.idx), w.idx))
