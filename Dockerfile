@@ -21,7 +21,8 @@ WORKDIR ${HOME}
 # reusing a stale cached clone layer.
 ARG TENGOKU_REFRESH=0
 RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
-RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh \
+ && rm -rf .lake/build/ir
 ENV LEAN_PROJECT_PATH=${HOME}/tengoku
 ENV TENGOKU_IMPORTS="Tengoku.All"
 
