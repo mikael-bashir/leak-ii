@@ -133,6 +133,12 @@ class PantographWorker:
 
 
 _pool: "list[PantographWorker]" = [PantographWorker(i) for i in range(POOL_SIZE)]
+# A Lean process reads thousands of library files while it loads. If the tree is being moved at that
+# moment (scripts/pin.sh unpacking a cache or laying a top-up over it) it can load a mix of old and new
+# files and never come up — seen on a cold start, when the first proof arrived while the start-up
+# refresh was unpacking. So loads and tree moves take turns. Processes that are already up are not
+# affected by a move (files are replaced by rename; they keep what they have mapped).
+_tree_lock = asyncio.Lock()
 proof_ledger: "OrderedDict[str, dict]" = OrderedDict()
 _op_count = 0
 
@@ -158,13 +164,15 @@ async def get_lean_server(worker: PantographWorker, force_restart: bool = False)
     if worker.server is None:
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         logger.info(f"🚨 [PANTO w{worker.idx}] constructing Pantograph Server (loading the Tengoku tree)…")
-        worker.server = await Server.create(
-            imports=TENGOKU_IMPORTS, project_path=project_dir, timeout=300
-        )
+        async with _tree_lock:
+            worker.server = await Server.create(
+                imports=TENGOKU_IMPORTS, project_path=project_dir, timeout=300
+            )
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server ready")
     elif force_restart or worker.server.proc is None:
         logger.warning(f"♻️  [PANTO w{worker.idx}] subprocess is dead (proc=None) — restarting it")
-        await worker.server.restart_async()
+        async with _tree_lock:
+            await worker.server.restart_async()
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server restarted")
     return worker.server
 
@@ -679,7 +687,8 @@ async def _tengoku_sync() -> str:
     try:
         before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
         await _ensure_pin()
-        rc, out = await _run([PIN_SH], TENGOKU_DIR, 3600)
+        async with _tree_lock:  # no Lean process may be loading while the tree moves
+            rc, out = await _run([PIN_SH], TENGOKU_DIR, 3600)
         tail = out.strip().splitlines()[-1] if out.strip() else ""
         if rc == 4:
             # pin.sh could not replay the newest state and put back the one we were serving.
