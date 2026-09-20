@@ -20,7 +20,14 @@ WORKDIR ${HOME}
 # nothing compiles. Changing TENGOKU_REFRESH re-clones on a rebuild instead of
 # reusing a stale cached clone layer.
 ARG TENGOKU_REFRESH=0
-RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
+# Which tree this service follows, and whether it follows the per-merge top-ups (1) or only the
+# nightly cache (0). Both are Space VARIABLES: Hugging Face passes them in as build args and as
+# runtime env, so moving the service to another tree is a variable change plus a factory rebuild.
+ARG TENGOKU_REPO=competemath/tengoku
+ARG TENGOKU_TOPUPS=1
+ENV TENGOKU_REPO=${TENGOKU_REPO}
+ENV TENGOKU_TOPUPS=${TENGOKU_TOPUPS}
+RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/${TENGOKU_REPO}.git tengoku
 RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh \
  && rm -rf .lake/build/ir
 ENV LEAN_PROJECT_PATH=${HOME}/tengoku
