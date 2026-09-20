@@ -122,9 +122,23 @@ class PantographWorker:
         # Pantograph's sequential integer state ids would ALIAS fresh states.
         self.dirty = False
         self.gen = 0
+        # Tree refresh without killing proofs in flight: a worker that still holds live proof states
+        # when the tree moves on is RETIRED instead of restarted — it takes no new proofs, keeps
+        # serving the states it has (its Lean process has the old library files mapped; the refresh
+        # only ever renames new files over them), and is stopped once they are freed or at
+        # `retire_at`. A fresh worker on the new tree takes its place for every new proof.
+        self.retiring = False
+        self.retired = False
+        self.retire_at = 0.0
 
 
 _pool: "list[PantographWorker]" = [PantographWorker(i) for i in range(POOL_SIZE)]
+# A Lean process reads thousands of library files while it loads. If the tree is being moved at that
+# moment (scripts/pin.sh unpacking a cache or laying a top-up over it) it can load a mix of old and new
+# files and never come up — seen on a cold start, when the first proof arrived while the start-up
+# refresh was unpacking. So loads and tree moves take turns. Processes that are already up are not
+# affected by a move (files are replaced by rename; they keep what they have mapped).
+_tree_lock = asyncio.Lock()
 proof_ledger: "OrderedDict[str, dict]" = OrderedDict()
 _op_count = 0
 
@@ -150,13 +164,15 @@ async def get_lean_server(worker: PantographWorker, force_restart: bool = False)
     if worker.server is None:
         project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         logger.info(f"🚨 [PANTO w{worker.idx}] constructing Pantograph Server (loading the Tengoku tree)…")
-        worker.server = await Server.create(
-            imports=TENGOKU_IMPORTS, project_path=project_dir, timeout=300
-        )
+        async with _tree_lock:
+            worker.server = await Server.create(
+                imports=TENGOKU_IMPORTS, project_path=project_dir, timeout=300
+            )
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server ready")
     elif force_restart or worker.server.proc is None:
         logger.warning(f"♻️  [PANTO w{worker.idx}] subprocess is dead (proc=None) — restarting it")
-        await worker.server.restart_async()
+        async with _tree_lock:
+            await worker.server.restart_async()
         logger.info(f"✅ [PANTO w{worker.idx}] Pantograph Server restarted")
     return worker.server
 
@@ -286,8 +302,13 @@ def _pick_worker() -> PantographWorker:
     then idle (unlocked) ones, then the fewest live states. A cold worker is
     only chosen while nothing is warmed yet (the boot window), matching the
     old single-worker behavior of the first call paying the tree load."""
-    warmed = [w for w in _pool if w.server is not None]
-    candidates = warmed if warmed else _pool
+    active = [w for w in _pool if not w.retiring and not w.retired]
+    warmed = [w for w in active if w.server is not None and not w.lock.locked()] or [w for w in active if w.server is not None]
+    if not warmed:
+        # Right after a refresh the fresh worker is still loading the tree. A retired worker is warm
+        # and consistent (old tree): better a proof there now than a multi-minute wait.
+        warmed = [w for w in _pool if w.retiring and not w.retired and w.server is not None]
+    candidates = warmed if warmed else active
     return min(candidates, key=lambda w: (w.lock.locked(), _live_count(w.idx), w.idx))
 
 
@@ -570,10 +591,27 @@ async def cleanup_memory(state_id: str = "") -> str:
 # start-up. `scripts/pin.sh` (in the tree) pins the tree to its newest
 # published cache; every resident Pantograph is then restarted clean, since
 # it loaded the old environment (its goal states die with it).
-_refresh = {"running": False, "last_post": 0.0, "last": ""}
+_refresh = {"running": False, "last_post": 0.0, "last": "", "queued": False, "count": 0, "kept": 0, "drained": 0, "forced": 0}
+# The tree publishes a small "top-up" with every merge (TENGOKU_TOPUPS=1 makes scripts/pin.sh follow
+# them), so refresh requests can arrive every few minutes. None is dropped: requests that arrive
+# while a refresh runs, inside the minimum gap, or while an older worker is still draining are folded
+# into one deferred refresh. A prover therefore sees ONE library for the length of its run, and the
+# service still ends on the newest published state.
+REFRESH_MIN_GAP = float(os.environ.get("TENGOKU_REFRESH_MIN_GAP", "300"))
+DRAIN_MAX = float(os.environ.get("TENGOKU_DRAIN_MAX", "2700"))   # s a retired worker may keep its proofs alive
 # TENGOKU_AUTO_REFRESH=0 turns every door off: for an instance that runs on a
 # developer's working tree (which must never be checked out or overwritten).
 AUTO_REFRESH = os.environ.get("TENGOKU_AUTO_REFRESH", "1") != "0"
+PIN_SH = os.path.join(TENGOKU_DIR, "scripts", "pin.sh")
+
+
+async def _ensure_pin() -> None:
+    """A tree pinned to a cache commit that predates scripts/pin.sh has no copy
+    of it: take the newest helper scripts from origin/main first."""
+    if os.path.exists(PIN_SH):
+        return
+    await _run(["git", "fetch", "-q", "origin", "main"], TENGOKU_DIR, 300)
+    await _run(["git", "checkout", "-q", "origin/main", "--", "scripts/pin.sh", "scripts/cache.sh"], TENGOKU_DIR, 60)
 
 
 async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
@@ -589,7 +627,8 @@ async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
 
 async def _tree_check() -> tuple[str, str]:
     """('current' | 'newer' | 'unknown', sha-or-detail) — changes nothing."""
-    rc, out = await _run(["scripts/pin.sh", "--check"], TENGOKU_DIR, 300)
+    await _ensure_pin()
+    rc, out = await _run([PIN_SH, "--check"], TENGOKU_DIR, 300)
     last = out.strip().splitlines()[-1] if out.strip() else ""
     parts = last.split()
     if rc in (0, 3) and len(parts) == 2 and parts[0] in ("current", "newer"):
@@ -597,27 +636,90 @@ async def _tree_check() -> tuple[str, str]:
     return "unknown", last[:200]
 
 
+def _draining() -> "list[PantographWorker]":
+    return [w for w in _pool if w.retiring and not w.retired]
+
+
+async def _stop_worker(w: PantographWorker, why: str, forced: bool) -> None:
+    """End a retired worker: its remaining states die here (exactly what EVERY refresh used to do to
+    every state). Caller must NOT hold w.lock."""
+    async with w.lock:
+        n = _purge_worker_states(w.idx)
+        try:
+            if w.server is not None and w.server.proc is not None:
+                proc = w.server.proc
+                proc.kill()  # asyncio subprocess (PyPantograph's async server)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=15)
+                except asyncio.TimeoutError:
+                    pass
+                w.server.proc = None
+        except Exception as e:
+            logger.warning(f"[w{w.idx}] could not kill the retired subprocess: {e}")
+        w.server = None
+        w.retired = True
+        _refresh["forced" if forced and n else "drained"] += 1
+        logger.info(f"🪦 [w{w.idx}] retired worker stopped ({why}); {n} state(s) ended with it")
+
+
+async def _janitor() -> None:
+    """Stop retired workers once their proofs are freed, or at their deadline; then let a refresh
+    that was waiting for the drain go ahead."""
+    while True:
+        await asyncio.sleep(20)
+        try:
+            for w in _draining():
+                if _live_count(w.idx) == 0:
+                    await _stop_worker(w, "its proofs were all freed", forced=False)
+                elif time.time() > w.retire_at:
+                    await _stop_worker(w, f"drain deadline ({DRAIN_MAX:.0f}s) reached", forced=True)
+        except Exception as e:
+            logger.warning(f"janitor: {e}")
+
+
 async def _tengoku_sync() -> str:
     if _refresh["running"]:
         return "⏳ tengoku_sync: a refresh is already running"
+    if _draining():
+        _queue_refresh(60)
+        return "⏳ tengoku_sync: an older worker is still finishing its proofs — the refresh follows as soon as it has drained"
     _refresh["running"] = True
     try:
         before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-        rc, out = await _run(["scripts/pin.sh"], TENGOKU_DIR, 3600)
+        await _ensure_pin()
+        async with _tree_lock:  # no Lean process may be loading while the tree moves
+            rc, out = await _run([PIN_SH], TENGOKU_DIR, 3600)
         tail = out.strip().splitlines()[-1] if out.strip() else ""
+        if rc == 4:
+            # pin.sh could not replay the newest state and put back the one we were serving.
+            _refresh["kept"] += 1
+            _refresh["last"] = f"kept {before}: {tail}"
+            return f"↩️ tengoku_sync: {tail} — still serving {before}, workers untouched."
         if rc != 0:
             _refresh["last"] = f"failed: {tail}"
             return "❌ tengoku_sync: could not pin the tree to the newest cache\n" + out[-2000:]
         after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-        restarted = 0
-        for w in _pool:
-            async with w.lock:
-                if w.server is not None:
-                    await _restart_worker_clean(w, "tree refreshed")
-                    restarted += 1
+        restarted = retired = 0
+        for w in [w for w in _pool if not w.retiring and not w.retired]:
+            if w.server is None:
+                continue  # never loaded: it will load the refreshed tree on first use
+            if _live_count(w.idx) == 0:
+                async with w.lock:
+                    if _live_count(w.idx) == 0:
+                        await _restart_worker_clean(w, "tree refreshed")
+                        restarted += 1
+                        continue
+            # Proofs are in flight on this worker: let them finish on the library they started with.
+            w.retiring, w.retire_at = True, time.time() + DRAIN_MAX
+            fresh = PantographWorker(len(_pool))
+            _pool.append(fresh)
+            asyncio.create_task(_warm_one(fresh))
+            retired += 1
+            logger.info(f"🌗 [w{w.idx}] keeps its {_live_count(w.idx)} live state(s) on the old tree (≤{DRAIN_MAX:.0f}s); w{fresh.idx} takes new proofs on the refreshed one")
+        _refresh["count"] += 1
         _refresh["last"] = f"{before} → {after}"
-        return (f"✅ tengoku_sync: tree {before} → {after} ({tail}); {restarted} resident Pantograph worker(s) "
-                "restarted on the refreshed tree — every earlier state id is invalid.")
+        return (f"✅ tengoku_sync: tree {before} → {after} ({tail}); {restarted} idle worker(s) restarted on the refreshed tree, "
+                f"{retired} busy worker(s) left to finish their proofs on the old one while a fresh worker takes new proofs.")
     finally:
         _refresh["running"] = False
 
@@ -635,6 +737,30 @@ async def tengoku_sync() -> str:
     return await _tengoku_sync()
 
 
+async def _refresh_later(delay: float) -> None:
+    """The one deferred refresh that stands in for every request folded into it."""
+    await asyncio.sleep(delay)
+    _refresh["queued"] = False
+    if _refresh["running"] or _draining():
+        _queue_refresh(60)
+        return
+    try:
+        _refresh["last_post"] = time.time()
+        status, _ = await _tree_check()
+        if status == "newer":
+            logger.info((await _tengoku_sync()).splitlines()[0])
+    except Exception as e:
+        logger.warning(f"deferred refresh failed: {e}")
+
+
+def _queue_refresh(delay: float) -> bool:
+    if _refresh["queued"]:
+        return False
+    _refresh["queued"] = True
+    asyncio.create_task(_refresh_later(max(5.0, delay)))
+    return True
+
+
 async def _refresh_endpoint(request):
     """GET: is a newer cache published than the one loaded? POST: if so, refresh
     in the background. Public on purpose: it can only ever move the tree to a
@@ -644,18 +770,27 @@ async def _refresh_endpoint(request):
     head = (await _run(["git", "rev-parse", "HEAD"], TENGOKU_DIR, 30))[1].strip()
     if request.method == "GET":
         status, sha = await _tree_check()
-        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "last": _refresh["last"]})
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "queued": _refresh["queued"],
+                             "last": _refresh["last"], "refreshes": _refresh["count"], "kept": _refresh["kept"],
+                             "workers": {"active": sum(1 for w in _pool if not w.retiring and not w.retired), "draining": len(_draining()),
+                                         "drained": _refresh["drained"], "forced": _refresh["forced"]},
+                             "live_states": len(proof_ledger), "topups": os.environ.get("TENGOKU_TOPUPS", "0")})
     if not AUTO_REFRESH:
         return JSONResponse({"status": "disabled", "pinned": head}, status_code=403)
-    if _refresh["running"]:
-        return JSONResponse({"status": "busy", "pinned": head}, status_code=409)
     now = time.time()
-    if now - _refresh["last_post"] < 300:
-        return JSONResponse({"status": "cooldown", "pinned": head}, status_code=429)
+    if _refresh["running"] or _draining():
+        _queue_refresh(60)
+        return JSONResponse({"status": "queued", "why": "a refresh is running" if _refresh["running"] else "an older worker is finishing its proofs", "pinned": head}, status_code=202)
+    if now - _refresh["last_post"] < REFRESH_MIN_GAP:
+        _queue_refresh(REFRESH_MIN_GAP - (now - _refresh["last_post"]))
+        return JSONResponse({"status": "queued", "why": "inside the minimum gap", "pinned": head}, status_code=202)
     _refresh["last_post"] = now
     status, sha = await _tree_check()
     if status != "newer":
-        return JSONResponse({"status": status, "pinned": head, "newest": sha})
+        # Somebody says the tree moved and we do not see it: the pointer is served through a CDN and
+        # can lag its update by seconds (seen in the soak). Look once more shortly, at no cost.
+        _queue_refresh(75)
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "recheck": "in 75 s"})
     asyncio.create_task(_tengoku_sync())
     return JSONResponse({"status": "refreshing", "pinned": head, "newest": sha}, status_code=202)
 
@@ -667,7 +802,11 @@ async def _startup():
         logger.info("🌳 Tree auto-refresh is off (TENGOKU_AUTO_REFRESH=0)")
         await _warmup()
         return
-    status, sha = await _tree_check()
+    try:
+        status, sha = await _tree_check()
+    except Exception as e:  # never let the check keep the service from warming up
+        logger.warning(f"tree check failed: {e}")
+        status, sha = "unknown", str(e)[:120]
     if status == "newer":
         logger.info(f"🌱 A newer Tengoku cache is published ({sha[:12]}) — refreshing before warm-up…")
         logger.info((await _tengoku_sync()).splitlines()[0])
@@ -679,11 +818,21 @@ async def _startup():
 # =============================================================================
 # BOOT
 # =============================================================================
+async def _warm_one(w: PantographWorker) -> None:
+    try:
+        async with w.lock:
+            server = await get_lean_server(w)
+            await server.goal_start_async("True")
+        logger.info(f"✅ w{w.idx} is resident on the refreshed tree and takes new proofs from now on.")
+    except Exception as e:
+        logger.error(f"⚠️  w{w.idx} did not finish loading the refreshed tree: {e}")
+
+
 async def _warmup():
     """Warm every worker sequentially in the background. The port opens
     immediately (HF marks healthy); each worker's lock makes real calls wait
     behind that worker's own warmup only."""
-    for w in _pool:
+    for w in [w for w in _pool if not w.retiring and not w.retired]:
         logger.info(f"⏳ Warmup w{w.idx}: constructing Pantograph + loading the Tengoku tree "
                     "(first load can take a while on a small CPU)…")
         try:
@@ -702,6 +851,7 @@ async def main_serve():
     logger.info("=" * 60)
 
     asyncio.create_task(_startup())
+    asyncio.create_task(_janitor())
 
     http_app = mcp.sse_app()
     http_app.add_route("/refresh", _refresh_endpoint, methods=["GET", "POST"])
